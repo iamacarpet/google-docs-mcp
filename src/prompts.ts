@@ -1,11 +1,16 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Docs editorial MCP server (native comments, comment anchors and suggestion mode).
+export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Docs editorial MCP server with first-class support for native comments, comment anchors, suggestion mode, rich text formatting, tables, images, and paragraph layout.
 
-1. WORKFLOW DISCOVERY FIRST
+1. WORKFLOW DISCOVERY FIRST & LOW-TOKEN READING
    - Start with doc_list_comments to survey open review threads, or doc_get_outline / doc_get_metadata to orient yourself.
    - Do NOT read the whole document unless explicitly asked. Use doc_read_comment_context(commentId) for a comment's anchored text plus surrounding paragraphs, and doc_read_range for an outline section (startIndex..sectionEndIndex).
+   - Low-token reading: doc_read_range returns plain text and compact Markdown annotatedText by default (with **bold**, *italic*, <u>underline</u>, ~~strikethrough~~, links, and image placeholders). This conveys full formatting without context bloat.
+   - Selective granular flags in doc_read_range:
+     * includeRuns: false (default). Set true ONLY when you need exact integer index bounds for each individual styled word or span.
+     * includeParagraphs: false (default). Set true ONLY when inspecting paragraph layout, spacing, padding, margins, or borders.
+     * In doc_inspect_tables: set includeCellText: false if you only need table dimensions, column counts, and index coordinates.
 
 2. EDITORIAL SUGGESTION POLICY
    - By default ALL revisions must be submitted as SUGGESTIONS (tracked changes), never direct overwrites.
@@ -13,17 +18,30 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
    - For several edits at once use doc_batch_suggest_edits (applied bottom-up automatically).
    - Use doc_apply_direct_edit ONLY if the user explicitly says e.g. "overwrite directly", "do not use suggestions" or "make definitive edits".
 
-3. CHARACTER COORDINATES & INDEX INTEGRITY
-   - Indices are exact 0-based UTF-16 code unit offsets, global to the document tab. Never approximate, guess or re-base them.
-   - Always take indices from doc_list_comments, doc_read_comment_context, doc_search_text, doc_get_outline or doc_list_suggestions.
-   - Pass expectedText (the exact current text of the range) to range-based edit tools whenever you can; the edit is rejected instead of corrupting text if the document changed.
-   - Each mutation changes indices below/after the edit point. If you need several independent range edits, submit them together via doc_batch_suggest_edits, or apply them one by one from the highest startIndex to the lowest.
-   - Keep each edit scoped to the minimum span (the comment's highlighted anchor or the exact phrase) to avoid unintended deletions.
+3. RICH TEXT FORMATTING & INLINE STYLES
+   - Format existing spans: Use doc_format_text to apply styling properties (bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl) to any range in SUGGEST or EDIT mode.
+   - Style while editing: Edit tools (doc_suggest_edit_range, doc_apply_direct_edit, doc_suggest_comment_revision, doc_batch_suggest_edits) accept an optional textStyle object ({ bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl }) to style inserted or replaced text immediately in the same call.
 
-4. READING CONVENTIONS
-   - Snippets mark the comment anchor as <target>…</target> and search hits as <match>…</match>; these markers are not document text.
-   - When suggestion markup is enabled, pending suggested deletions appear as [-text-] and insertions as {+text+}.
-   - U+FFFC (￼) stands for a non-text element (image, smart chip, etc.). Table/section structure markers are omitted from rendered text, so rendered text length may differ from endIndex - startIndex inside tables; rely on the reported indices.`;
+4. PARAGRAPH STYLES, SPACING & PADDING
+   - Use doc_format_paragraph to customize paragraphs overlapping [startIndex, endIndex):
+     * Headings: namedStyleType ('TITLE', 'SUBTITLE', 'HEADING_1' through 'HEADING_6', 'NORMAL_TEXT').
+     * Alignment: alignment ('START', 'CENTER', 'END', 'JUSTIFIED').
+     * Spacing: spaceAbove (points), spaceBelow (points), lineSpacing (percentage e.g. 100 for single, 115 for 1.15x, 150 for 1.5x, 200 for double), spacingMode.
+     * Margins & Indentation: indentStart (left margin in PT), indentEnd (right margin in PT), indentFirstLine (first-line indent in PT).
+     * Border Padding: padding (shorthand across all borders in PT) or individual borderTop, borderBottom, borderLeft, borderRight, borderBetween with { padding, width, dashStyle, color }.
+     * Background Shading: shadingColor (hex color string e.g. "#F0F0F0").
+     * Pagination Controls: keepWithNext (keeps headings with the following paragraph), keepLinesTogether, avoidWidowAndOrphan, pageBreakBefore.
+     * Lists: bulletPreset ('BULLET_DISC_CIRCLE_SQUARE', 'BULLET_CHECKBOX', 'NUMBERED_DECIMAL_ALPHA_ROMAN', etc.) or removeBullets.
+
+5. TABLES & IMAGES
+   - Tables: Inspect tables via doc_inspect_tables. Insert tables via doc_insert_table. Add or remove rows/columns via doc_modify_table.
+   - Images: Insert inline images via doc_insert_image from public HTTPS URLs with optional widthPt and heightPt.
+
+6. CHARACTER COORDINATES & INDEX INTEGRITY
+   - Indices are exact 0-based UTF-16 code unit offsets, global to the document tab. Never approximate, guess or re-base them.
+   - Always take indices from doc_list_comments, doc_read_comment_context, doc_search_text, doc_get_outline, doc_inspect_tables, or doc_list_suggestions.
+   - Pass expectedText (the exact current text of the range) to range-based edit tools whenever you can; the edit is rejected instead of corrupting text if the document changed.
+   - Keep each edit scoped to the minimum span (the comment's highlighted anchor or the exact phrase) to avoid unintended deletions.`;
 
 export function reviewCommentsPrompt(documentId: string, tone?: string): string {
   return `Review the open comments in Google Doc ${documentId} and propose revisions.
@@ -37,6 +55,32 @@ Steps:
 4. Submit each revision with doc_suggest_comment_revision (suggestion mode, resolves the thread). For several comments you may use doc_batch_suggest_edits with commentId items.
 5. For comments that are questions or need the author's judgement, reply with doc_reply_comment instead of editing.
 6. Finish with a short summary table: commentId, action taken, and the suggested text.`;
+}
+
+export function formatDocumentSectionPrompt(documentId: string, sectionTitle?: string, goal?: string): string {
+  return `Review and refine typography, paragraph spacing, and layout consistency for Google Doc ${documentId}${sectionTitle ? ` (section: "${sectionTitle}")` : ''}.
+
+Steps:
+1. Locate the target section using doc_get_outline or doc_search_text.
+2. Call doc_read_range with includeAnnotatedText=true (and includeParagraphs=true if inspecting paragraph spacing or margins) to analyze the section.
+3. Identify formatting or layout improvements:${goal ? `\n   Goal: ${goal}.` : ''}
+   - Inconsistent heading styles, line spacing, or paragraph gaps (spaceAbove / spaceBelow).
+   - Missing emphasis (bold, italic) or unstyled terms.
+   - Lists that should use bulletPreset.
+4. Apply improvements:
+   - For paragraph layout (spacing, alignment, indentation, border padding, shading), use doc_format_paragraph.
+   - For text styling (bold, italic, links, colors), use doc_format_text or edit tools with textStyle.
+5. Summarize the changes and layout parameters applied.`;
+}
+
+export function inspectLayoutPrompt(documentId: string): string {
+  return `Inspect and summarize the structural layout, tables, and typography hierarchy for Google Doc ${documentId}.
+
+Steps:
+1. Check overall document statistics with doc_get_metadata (character count, table count, image count).
+2. Fetch the document outline hierarchy with doc_get_outline.
+3. If tables are present, inspect their dimensions and structure with doc_inspect_tables (using includeCellText=false for a compact survey).
+4. Provide a structured report of the document's sections, tables, and formatting profile.`;
 }
 
 export function registerPrompts(server: McpServer): void {
@@ -62,5 +106,50 @@ export function registerPrompts(server: McpServer): void {
       ],
     }),
   );
-}
 
+  server.registerPrompt(
+    'format_document_section',
+    {
+      title: 'Format and restyle document section',
+      description: 'Reviews and refines typography, paragraph spacing, and layout consistency for a section of a Google Doc.',
+      argsSchema: {
+        documentId: z.string().describe('Google Doc ID or URL'),
+        sectionTitle: z.string().optional().describe('Title of the section to format (or omit for the whole document)'),
+        goal: z.string().optional().describe('Specific styling objective (e.g. "executive memo layout", "consistent 12pt with 6pt space below")'),
+      },
+    },
+    (args) => ({
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: formatDocumentSectionPrompt(args.documentId, args.sectionTitle, args.goal),
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    'inspect_layout',
+    {
+      title: 'Inspect layout and document structure',
+      description: 'Surveys document headings, table dimensions, and layout elements with minimal token consumption.',
+      argsSchema: {
+        documentId: z.string().describe('Google Doc ID or URL'),
+      },
+    },
+    (args) => ({
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: inspectLayoutPrompt(args.documentId),
+          },
+        },
+      ],
+    }),
+  );
+}

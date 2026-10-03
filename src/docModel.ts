@@ -1,6 +1,7 @@
 /**
  * Document model: converts a raw Google Docs `documents.get` response into a
- * compact, index-faithful in-memory representation.
+ * compact, index-faithful in-memory representation with rich-text, layout,
+ * table, and image support.
  *
  * Coordinate contract
  * -------------------
@@ -31,10 +32,46 @@ export interface IndexRange {
   endIndex: number;
 }
 
+export interface ParagraphBorderInfo {
+  padding?: number;
+  width?: number;
+  dashStyle?: string;
+  color?: string;
+}
+
+export interface ParagraphStyleInfo {
+  namedStyleType?: string;
+  alignment?: 'START' | 'CENTER' | 'END' | 'JUSTIFIED';
+  lineSpacing?: number;
+  spaceAbove?: number;
+  spaceBelow?: number;
+  spacingMode?: string;
+  indentStart?: number;
+  indentEnd?: number;
+  indentFirstLine?: number;
+  keepLinesTogether?: boolean;
+  keepWithNext?: boolean;
+  avoidWidowAndOrphan?: boolean;
+  pageBreakBefore?: boolean;
+  shadingColor?: string;
+  borderTop?: ParagraphBorderInfo;
+  borderBottom?: ParagraphBorderInfo;
+  borderLeft?: ParagraphBorderInfo;
+  borderRight?: ParagraphBorderInfo;
+  borderBetween?: ParagraphBorderInfo;
+}
+
 export interface ParagraphInfo extends IndexRange {
   namedStyleType: string;
+  alignment?: string;
+  style?: ParagraphStyleInfo;
   hasBullet: boolean;
   inTable: boolean;
+  tableContext?: {
+    tableIndex: number;
+    rowIndex: number;
+    columnIndex: number;
+  };
 }
 
 export interface SuggestionMark extends IndexRange {
@@ -55,6 +92,50 @@ export interface OutlineEntry {
   /** End of the section this heading introduces (start of next heading of same/higher rank, or end of tab). */
   sectionEndIndex: number;
   isPseudo: boolean;
+  inTable?: boolean;
+}
+
+export interface TextStyleInfo {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  fontSize?: number;
+  foregroundColor?: string;
+  backgroundColor?: string;
+  linkUrl?: string;
+}
+
+export interface StyledRun extends IndexRange {
+  text: string;
+  style: TextStyleInfo;
+}
+
+export interface TableCellModel extends IndexRange {
+  rowIndex: number;
+  columnIndex: number;
+  text: string;
+}
+
+export interface TableModel extends IndexRange {
+  tableIndex: number;
+  rows: number;
+  columns: number;
+  cells: TableCellModel[];
+}
+
+export interface ImageModel extends IndexRange {
+  objectId: string;
+  title?: string;
+  description?: string;
+  contentUri?: string;
+  width?: number;
+  height?: number;
+}
+
+export interface DocumentElementModel extends IndexRange {
+  type: 'image' | 'horizontalRule' | 'pageBreak' | 'columnBreak' | 'equation' | 'date' | 'richLink';
+  detail?: string;
 }
 
 export interface TabModel {
@@ -69,6 +150,10 @@ export interface TabModel {
   commentAnchors: Map<string, IndexRange[]>;
   suggestionMarks: SuggestionMark[];
   suggestionSpans: Map<string, SuggestionSpan>;
+  styledRuns: StyledRun[];
+  tables: TableModel[];
+  images: ImageModel[];
+  elements: DocumentElementModel[];
   /** Lazily computed case-folded copy of `text` (same length). */
   foldedText?: string;
 }
@@ -109,6 +194,7 @@ export interface DocModel {
   suggestionThreads: SuggestionThreadInfo[];
   commentsAvailable: boolean;
   commentsUnavailableReason?: string;
+  inlineObjects?: Record<string, any>;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,20 +207,92 @@ export interface BuildOptions {
   fetchedAt?: number;
 }
 
+export function formatColor(rgb?: { red?: number | null; green?: number | null; blue?: number | null }): string | undefined {
+  if (!rgb) return undefined;
+  const r = Math.round((rgb.red ?? 0) * 255)
+    .toString(16)
+    .padStart(2, '0');
+  const g = Math.round((rgb.green ?? 0) * 255)
+    .toString(16)
+    .padStart(2, '0');
+  const b = Math.round((rgb.blue ?? 0) * 255)
+    .toString(16)
+    .padStart(2, '0');
+  return `#${r}${g}${b}`;
+}
+
+export function parseParagraphBorder(b?: any): ParagraphBorderInfo | undefined {
+  if (!b) return undefined;
+  const res: ParagraphBorderInfo = {};
+  if (b.padding?.magnitude !== undefined && b.padding?.magnitude !== null) res.padding = b.padding.magnitude;
+  if (b.width?.magnitude !== undefined && b.width?.magnitude !== null) res.width = b.width.magnitude;
+  if (b.dashStyle) res.dashStyle = b.dashStyle;
+  const c = formatColor(b.color?.color?.rgbColor);
+  if (c) res.color = c;
+  return Object.keys(res).length > 0 ? res : undefined;
+}
+
+export function parseParagraphStyle(ps?: any): ParagraphStyleInfo | undefined {
+  if (!ps) return undefined;
+  const res: ParagraphStyleInfo = {};
+  if (ps.namedStyleType) res.namedStyleType = ps.namedStyleType;
+  if (ps.alignment) res.alignment = ps.alignment;
+  if (ps.lineSpacing !== undefined && ps.lineSpacing !== null) res.lineSpacing = ps.lineSpacing;
+  if (ps.spaceAbove?.magnitude !== undefined && ps.spaceAbove?.magnitude !== null) res.spaceAbove = ps.spaceAbove.magnitude;
+  if (ps.spaceBelow?.magnitude !== undefined && ps.spaceBelow?.magnitude !== null) res.spaceBelow = ps.spaceBelow.magnitude;
+  if (ps.spacingMode) res.spacingMode = ps.spacingMode;
+  if (ps.indentStart?.magnitude !== undefined && ps.indentStart?.magnitude !== null) res.indentStart = ps.indentStart.magnitude;
+  if (ps.indentEnd?.magnitude !== undefined && ps.indentEnd?.magnitude !== null) res.indentEnd = ps.indentEnd.magnitude;
+  if (ps.indentFirstLine?.magnitude !== undefined && ps.indentFirstLine?.magnitude !== null) res.indentFirstLine = ps.indentFirstLine.magnitude;
+  if (ps.keepLinesTogether !== undefined && ps.keepLinesTogether !== null) res.keepLinesTogether = ps.keepLinesTogether;
+  if (ps.keepWithNext !== undefined && ps.keepWithNext !== null) res.keepWithNext = ps.keepWithNext;
+  if (ps.avoidWidowAndOrphan !== undefined && ps.avoidWidowAndOrphan !== null) res.avoidWidowAndOrphan = ps.avoidWidowAndOrphan;
+  if (ps.pageBreakBefore !== undefined && ps.pageBreakBefore !== null) res.pageBreakBefore = ps.pageBreakBefore;
+  const bg = formatColor(ps.shading?.backgroundColor?.color?.rgbColor);
+  if (bg) res.shadingColor = bg;
+  const bt = parseParagraphBorder(ps.borderTop);
+  if (bt) res.borderTop = bt;
+  const bb = parseParagraphBorder(ps.borderBottom);
+  if (bb) res.borderBottom = bb;
+  const bl = parseParagraphBorder(ps.borderLeft);
+  if (bl) res.borderLeft = bl;
+  const br = parseParagraphBorder(ps.borderRight);
+  if (br) res.borderRight = br;
+  const bbw = parseParagraphBorder(ps.borderBetween);
+  if (bbw) res.borderBetween = bbw;
+
+  return Object.keys(res).length > 0 ? res : undefined;
+}
+
+function sameStyle(a: TextStyleInfo, b: TextStyleInfo): boolean {
+  return (
+    !!a.bold === !!b.bold &&
+    !!a.italic === !!b.italic &&
+    !!a.underline === !!b.underline &&
+    !!a.strikethrough === !!b.strikethrough &&
+    a.fontSize === b.fontSize &&
+    a.foregroundColor === b.foregroundColor &&
+    a.backgroundColor === b.backgroundColor &&
+    a.linkUrl === b.linkUrl
+  );
+}
+
 export function buildDocModel(raw: docs_v1.Schema$Document, opts: BuildOptions): DocModel {
   const tabs: TabModel[] = [];
+  const inlineObjects = raw.inlineObjects ?? {};
+
   if (Array.isArray(raw.tabs) && raw.tabs.length > 0) {
     const visit = (tab: Raw, level: number) => {
       const props = tab.tabProperties ?? {};
       if (tab.documentTab) {
-        tabs.push(buildTab(props.tabId ?? '', props.title ?? '', level, tab.documentTab));
+        tabs.push(buildTab(props.tabId ?? '', props.title ?? '', level, tab.documentTab, inlineObjects));
       }
       for (const child of tab.childTabs ?? []) visit(child, level + 1);
     };
     for (const t of raw.tabs) visit(t, 0);
   } else {
     // Legacy single-tab shape (includeTabsContent=false).
-    tabs.push(buildTab('', raw.title ?? '', 0, raw));
+    tabs.push(buildTab('', raw.title ?? '', 0, raw, inlineObjects));
   }
 
   return {
@@ -147,6 +305,7 @@ export function buildDocModel(raw: docs_v1.Schema$Document, opts: BuildOptions):
     suggestionThreads: (raw.suggestions ?? []).map(parseSuggestionThread),
     commentsAvailable: opts.commentsAvailable,
     commentsUnavailableReason: opts.commentsUnavailableReason,
+    inlineObjects,
   };
 }
 
@@ -166,7 +325,7 @@ function elementPayload(pe: Raw): Raw | undefined {
   return undefined;
 }
 
-function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): TabModel {
+function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw, inlineObjects?: Record<string, any>): TabModel {
   const content: Raw[] = dt.body?.content ?? [];
   const endIndex: number = content.length ? content[content.length - 1].endIndex ?? 0 : 0;
   const chars: string[] = new Array(endIndex).fill(GAP);
@@ -176,12 +335,18 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
   const styles = namedStyleMap(dt.namedStyles);
   const baseSize: number = styles.get('NORMAL_TEXT')?.textStyle?.fontSize?.magnitude ?? 11;
 
+  const styledRuns: StyledRun[] = [];
+  const tables: TableModel[] = [];
+  const images: ImageModel[] = [];
+  const elements: DocumentElementModel[] = [];
+
   interface Candidate {
     level: number;
     title: string;
     startIndex: number;
     endIndex: number;
     isPseudo: boolean;
+    inTable?: boolean;
   }
   const candidates: Candidate[] = [];
   let lastFormalLevel = 0;
@@ -226,8 +391,12 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
     else if (ins.length) addMark('insertion', ins, start, end);
   };
 
-  const walk = (elements: Raw[], inTable: boolean) => {
-    for (const el of elements) {
+  const walk = (
+    elementList: Raw[],
+    inTable: boolean,
+    tableCtx?: { tableIndex: number; rowIndex: number; columnIndex: number },
+  ) => {
+    for (const el of elementList) {
       const elStart: number = el.startIndex ?? 0;
       const elEnd: number = el.endIndex ?? elStart;
       if (el.paragraph) {
@@ -255,6 +424,60 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
             }
             trackSuggestions(pe.textRun, s, e);
             for (const id of Object.keys(pe.textRun.suggestedTextStyleChanges ?? {})) addSpan(id, 'textStyle', s, e);
+
+            const style: TextStyleInfo = {
+              bold: ts.bold ?? ns?.textStyle?.bold ?? false,
+              italic: ts.italic ?? ns?.textStyle?.italic ?? false,
+              underline: ts.underline ?? ns?.textStyle?.underline ?? false,
+              strikethrough: ts.strikethrough ?? ns?.textStyle?.strikethrough ?? false,
+              fontSize: ts.fontSize?.magnitude ?? ns?.textStyle?.fontSize?.magnitude ?? undefined,
+              foregroundColor: formatColor(ts.foregroundColor?.color?.rgbColor),
+              backgroundColor: formatColor(ts.backgroundColor?.color?.rgbColor),
+              linkUrl: ts.link?.url ?? undefined,
+            };
+
+            const lastRun = styledRuns[styledRuns.length - 1];
+            if (lastRun && lastRun.endIndex === s && sameStyle(lastRun.style, style)) {
+              lastRun.endIndex = e;
+              lastRun.text += c;
+            } else {
+              styledRuns.push({
+                startIndex: s,
+                endIndex: e,
+                text: c,
+                style,
+              });
+            }
+          } else if (pe.inlineObjectElement) {
+            fill(s, e, OBJ);
+            text += OBJ.repeat(Math.max(0, e - s));
+            trackSuggestions(elementPayload(pe), s, e);
+            const objId: string = pe.inlineObjectElement.inlineObjectId ?? '';
+            const objProp = inlineObjects?.[objId]?.inlineObjectProperties?.embeddedObject;
+            images.push({
+              startIndex: s,
+              endIndex: e,
+              objectId: objId,
+              title: objProp?.title ?? undefined,
+              description: objProp?.description ?? undefined,
+              contentUri: objProp?.imageProperties?.contentUri ?? undefined,
+              width: objProp?.size?.width?.magnitude ?? undefined,
+              height: objProp?.size?.height?.magnitude ?? undefined,
+            });
+            elements.push({
+              type: 'image',
+              startIndex: s,
+              endIndex: e,
+              detail: objProp?.title || objProp?.description || objId,
+            });
+          } else if (pe.horizontalRule) {
+            fill(s, e, OBJ);
+            text += OBJ.repeat(Math.max(0, e - s));
+            elements.push({ type: 'horizontalRule', startIndex: s, endIndex: e });
+          } else if (pe.pageBreak) {
+            fill(s, e, OBJ);
+            text += OBJ.repeat(Math.max(0, e - s));
+            elements.push({ type: 'pageBreak', startIndex: s, endIndex: e });
           } else {
             fill(s, e, OBJ);
             text += OBJ.repeat(Math.max(0, e - s));
@@ -264,36 +487,75 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
         for (const id of Object.keys(p.suggestedParagraphStyleChanges ?? {})) addSpan(id, 'paragraphStyle', elStart, elEnd);
         for (const id of Object.keys(p.suggestedBulletChanges ?? {})) addSpan(id, 'bullet', elStart, elEnd);
 
-        paragraphs.push({ startIndex: elStart, endIndex: elEnd, namedStyleType: nst, hasBullet: !!p.bullet, inTable });
+        paragraphs.push({
+          startIndex: elStart,
+          endIndex: elEnd,
+          namedStyleType: nst,
+          alignment: p.paragraphStyle?.alignment ?? undefined,
+          style: parseParagraphStyle(p.paragraphStyle),
+          hasBullet: !!p.bullet,
+          inTable,
+          tableContext: tableCtx,
+        });
 
-        if (!inTable) {
-          const clean = text.replace(/\n$/, '').replace(new RegExp(OBJ, 'g'), '').trim();
-          if (clean) {
-            if (nst.startsWith('HEADING_') || nst === 'TITLE') {
-              const level = nst === 'TITLE' ? 0 : parseInt(nst.slice('HEADING_'.length), 10) || 1;
-              lastFormalLevel = level;
-              candidates.push({ level, title: clean, startIndex: elStart, endIndex: elEnd, isPseudo: false });
-            } else if (
-              !p.bullet &&
-              clean.length < 80 &&
-              !clean.includes('\u000b') &&
-              anyVisible &&
-              (allBold || maxSize > baseSize)
-            ) {
-              candidates.push({
-                level: Math.min(6, lastFormalLevel + 1),
-                title: clean,
-                startIndex: elStart,
-                endIndex: elEnd,
-                isPseudo: true,
-              });
-            }
+        const clean = text.replace(/\n$/, '').replace(new RegExp(OBJ, 'g'), '').trim();
+        if (clean) {
+          if (nst.startsWith('HEADING_') || nst === 'TITLE') {
+            const level = nst === 'TITLE' ? 0 : parseInt(nst.slice('HEADING_'.length), 10) || 1;
+            lastFormalLevel = level;
+            candidates.push({ level, title: clean, startIndex: elStart, endIndex: elEnd, isPseudo: false, inTable });
+          } else if (
+            !inTable &&
+            !p.bullet &&
+            clean.length < 80 &&
+            !clean.includes('\u000b') &&
+            anyVisible &&
+            (allBold || maxSize > baseSize)
+          ) {
+            candidates.push({
+              level: Math.min(6, lastFormalLevel + 1),
+              title: clean,
+              startIndex: elStart,
+              endIndex: elEnd,
+              isPseudo: true,
+              inTable: false,
+            });
           }
         }
       } else if (el.table) {
-        for (const row of el.table.tableRows ?? []) {
-          for (const cell of row.tableCells ?? []) walk(cell.content ?? [], true);
+        const tableStart = el.startIndex ?? 0;
+        const tableEnd = el.endIndex ?? tableStart;
+        const tableRows = el.table.tableRows ?? [];
+        const rowCount = tableRows.length;
+        const colCount = el.table.columns ?? (tableRows[0]?.tableCells?.length ?? 0);
+        const cells: TableCellModel[] = [];
+        const currentTableIndex = tables.length;
+
+        for (let rIdx = 0; rIdx < rowCount; rIdx++) {
+          const row = tableRows[rIdx];
+          const rowCells = row.tableCells ?? [];
+          for (let cIdx = 0; cIdx < rowCells.length; cIdx++) {
+            const cell = rowCells[cIdx];
+            const cellStart = cell.startIndex ?? 0;
+            const cellEnd = cell.endIndex ?? cellStart;
+            walk(cell.content ?? [], true, { tableIndex: currentTableIndex, rowIndex: rIdx, columnIndex: cIdx });
+            cells.push({
+              rowIndex: rIdx,
+              columnIndex: cIdx,
+              startIndex: cellStart,
+              endIndex: cellEnd,
+              text: '', // populated below after walk
+            });
+          }
         }
+        tables.push({
+          tableIndex: currentTableIndex,
+          startIndex: tableStart,
+          endIndex: tableEnd,
+          rows: rowCount,
+          columns: colCount,
+          cells,
+        });
       } else if (el.tableOfContents) {
         walk(el.tableOfContents.content ?? [], true);
       }
@@ -301,6 +563,14 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
     }
   };
   walk(content, false);
+
+  // Populate cell text from chars buffer
+  for (const table of tables) {
+    for (const cell of table.cells) {
+      const rawCell = chars.slice(cell.startIndex, cell.endIndex).join('');
+      cell.text = sanitize(rawCell).trim();
+    }
+  }
 
   const outline: OutlineEntry[] = candidates.map((c, i) => {
     let sectionEnd = endIndex;
@@ -333,6 +603,10 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw): 
     commentAnchors,
     suggestionMarks: marks,
     suggestionSpans: spans,
+    styledRuns,
+    tables,
+    images,
+    elements,
   };
 }
 
@@ -390,7 +664,7 @@ function parseSuggestionThread(s: Raw): SuggestionThreadInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Queries
+// Queries & Slicers
 // ---------------------------------------------------------------------------
 
 export function getTab(model: DocModel, tabId?: string): TabModel {
@@ -422,14 +696,14 @@ export function paragraphIndexAt(tab: TabModel, index: number): number {
   return ans;
 }
 
-function sanitize(s: string): string {
+export function sanitize(s: string): string {
   return s.split(GAP).join('');
 }
 
 /**
- * Renders [start, end) as human-readable text. GAP markers are dropped.
+ * Renders [start, end) as plain human-readable text. GAP markers are dropped.
  * When `markSuggestions` is set, pending suggested deletions are wrapped as
- * `[-text-]` and suggested insertions as `{+text+}` (markup is NOT document text).
+ * `[-text-]` and suggested insertions as `{+text+}`.
  */
 export function renderText(tab: TabModel, start: number, end: number, markSuggestions = false): string {
   start = Math.max(0, start);
@@ -450,6 +724,134 @@ export function renderText(tab: TabModel, start: number, end: number, markSugges
   }
   if (pos < end) out += sanitize(tab.text.slice(pos, end));
   return out;
+}
+
+/**
+ * Renders [start, end) as rich Markdown-annotated text preserving formatting:
+ *  - Bold: **text**
+ *  - Italic: *text*
+ *  - Underline: <u>text</u>
+ *  - Strikethrough: ~~text~~
+ *  - Links: [text](url)
+ *  - Images: [Image: title (WxH)]
+ */
+export function renderAnnotatedText(tab: TabModel, start: number, end: number, markSuggestions = false): string {
+  start = Math.max(0, start);
+  end = Math.min(tab.endIndex, end);
+  if (end <= start) return '';
+
+  const runs = tab.styledRuns.filter((r) => r.endIndex > start && r.startIndex < end);
+  if (runs.length === 0) return renderText(tab, start, end, markSuggestions);
+
+  let out = '';
+  let pos = start;
+
+  for (const run of runs) {
+    const s = Math.max(run.startIndex, start);
+    const e = Math.min(run.endIndex, end);
+
+    if (s > pos) {
+      out += renderText(tab, pos, s, markSuggestions);
+    }
+
+    let textSlice = sanitize(tab.text.slice(s, e));
+    if (textSlice.length > 0) {
+      if (markSuggestions && tab.suggestionMarks.length > 0) {
+        textSlice = renderText(tab, s, e, true);
+      }
+
+      // Preserve leading and trailing whitespace outside formatting markdown
+      const match = textSlice.match(/^(\s*)(.*?)(\s*)$/s);
+      const leading = match ? match[1] : '';
+      let body = match ? match[2] : textSlice;
+      const trailing = match ? match[3] : '';
+
+      if (body) {
+        const { bold, italic, underline, strikethrough, linkUrl } = run.style;
+        if (strikethrough) body = `~~${body}~~`;
+        if (underline) body = `<u>${body}</u>`;
+        if (italic) body = `*${body}*`;
+        if (bold) body = `**${body}**`;
+        if (linkUrl) body = `[${body}](${linkUrl})`;
+      }
+
+      out += leading + body + trailing;
+    }
+    pos = e;
+  }
+
+  if (pos < end) {
+    out += renderText(tab, pos, end, markSuggestions);
+  }
+
+  // Annotate inline images
+  for (const img of tab.images) {
+    if (img.startIndex >= start && img.endIndex <= end) {
+      const label = img.title || img.description || 'Image';
+      const dim = img.width && img.height ? ` (${Math.round(img.width)}x${Math.round(img.height)})` : '';
+      out = out.split(OBJ).join(`[Image: ${label}${dim}]`);
+    }
+  }
+
+  return out;
+}
+
+export function getRunsInRange(tab: TabModel, start: number, end: number): StyledRun[] {
+  return tab.styledRuns
+    .filter((r) => r.endIndex > start && r.startIndex < end)
+    .map((r) => {
+      const s = Math.max(r.startIndex, start);
+      const e = Math.min(r.endIndex, end);
+      return {
+        startIndex: s,
+        endIndex: e,
+        text: sanitize(tab.text.slice(s, e)),
+        style: r.style,
+      };
+    });
+}
+
+export function getTablesInRange(tab: TabModel, start: number, end: number): TableModel[] {
+  return tab.tables.filter((t) => t.endIndex > start && t.startIndex < end);
+}
+
+export function getParagraphsInRange(tab: TabModel, start: number, end: number): ParagraphInfo[] {
+  return tab.paragraphs.filter((p) => Math.max(p.startIndex, start) < Math.min(p.endIndex, end));
+}
+
+export function getTableContext(
+  tab: TabModel,
+  index: number,
+): { tableIndex: number; tableStart: number; tableEnd: number; rowIndex: number; columnIndex: number; cellRange: IndexRange } | null {
+  for (const table of tab.tables) {
+    if (index >= table.startIndex && index < table.endIndex) {
+      for (const cell of table.cells) {
+        if (index >= cell.startIndex && index < cell.endIndex) {
+          return {
+            tableIndex: table.tableIndex,
+            tableStart: table.startIndex,
+            tableEnd: table.endIndex,
+            rowIndex: cell.rowIndex,
+            columnIndex: cell.columnIndex,
+            cellRange: { startIndex: cell.startIndex, endIndex: cell.endIndex },
+          };
+        }
+      }
+      return {
+        tableIndex: table.tableIndex,
+        tableStart: table.startIndex,
+        tableEnd: table.endIndex,
+        rowIndex: -1,
+        columnIndex: -1,
+        cellRange: { startIndex: table.startIndex, endIndex: table.endIndex },
+      };
+    }
+  }
+  return null;
+}
+
+export function getImagesInRange(tab: TabModel, start: number, end: number): ImageModel[] {
+  return tab.images.filter((img) => img.endIndex > start && img.startIndex < end);
 }
 
 function foldChar(c: string): string {

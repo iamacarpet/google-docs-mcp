@@ -205,3 +205,213 @@ export function createSampleDocument(): any {
 
   return doc;
 }
+
+export function createFormattedDocument(): any {
+  return {
+    documentId: 'doc_formatted_001',
+    title: 'Project Proposal & Review',
+    revisionId: 'rev_formatted_001',
+    namedStyles: {
+      styles: [
+        { namedStyleType: 'NORMAL_TEXT', textStyle: { fontSize: { magnitude: 11, unit: 'PT' } } },
+        { namedStyleType: 'HEADING_1', textStyle: { fontSize: { magnitude: 18, unit: 'PT' }, bold: true } },
+      ],
+    },
+    body: {
+      content: [
+        { startIndex: 0, endIndex: 1, sectionBreak: {} },
+        {
+          startIndex: 1,
+          endIndex: 31,
+          paragraph: {
+            paragraphStyle: { namedStyleType: 'TITLE' },
+            elements: [
+              {
+                startIndex: 1,
+                endIndex: 31,
+                textRun: { content: 'Project Proposal & Review Doc\n', textStyle: { bold: true } },
+              },
+            ],
+          },
+        },
+        {
+          startIndex: 31,
+          endIndex: 60,
+          paragraph: {
+            paragraphStyle: { namedStyleType: 'HEADING_1' },
+            elements: [
+              {
+                startIndex: 31,
+                endIndex: 60,
+                textRun: { content: 'Section 1: Core Deliverables\n', textStyle: { bold: true } },
+              },
+            ],
+          },
+        },
+        {
+          startIndex: 60,
+          endIndex: 220,
+          table: {
+            rows: 2,
+            columns: 2,
+            tableRows: [
+              {
+                startIndex: 61,
+                endIndex: 105,
+                tableCells: [
+                  {
+                    startIndex: 62,
+                    endIndex: 80,
+                    content: [
+                      {
+                        startIndex: 63,
+                        endIndex: 80,
+                        paragraph: {
+                          elements: [
+                            {
+                              startIndex: 63,
+                              endIndex: 80,
+                              textRun: { content: 'Requirement Item\n', textStyle: { bold: true } },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                  {
+                    startIndex: 81,
+                    endIndex: 104,
+                    content: [
+                      {
+                        startIndex: 82,
+                        endIndex: 104,
+                        paragraph: {
+                          elements: [
+                            {
+                              startIndex: 82,
+                              endIndex: 104,
+                              textRun: { content: 'Proposed Deliverables\n', textStyle: { bold: true } },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                ],
+              },
+              {
+                startIndex: 105,
+                endIndex: 219,
+                tableCells: [
+                  {
+                    startIndex: 106,
+                    endIndex: 130,
+                    content: [
+                      {
+                        startIndex: 107,
+                        endIndex: 130,
+                        paragraph: {
+                          elements: [
+                            {
+                              startIndex: 107,
+                              endIndex: 130,
+                              textRun: { content: 'Feature & System Scope\n' },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                  {
+                    startIndex: 131,
+                    endIndex: 218,
+                    content: [
+                      {
+                        startIndex: 132,
+                        endIndex: 153,
+                        paragraph: {
+                          elements: [
+                            {
+                              startIndex: 132,
+                              endIndex: 153,
+                              textRun: { content: 'Deliverable includes ' },
+                            },
+                            {
+                              startIndex: 153,
+                              endIndex: 161,
+                              textRun: {
+                                content: '10 days ',
+                                textStyle: { italic: true, strikethrough: true },
+                              },
+                            },
+                            {
+                              startIndex: 161,
+                              endIndex: 169,
+                              textRun: {
+                                content: '20 days ',
+                                textStyle: { bold: true },
+                              },
+                            },
+                            {
+                              startIndex: 169,
+                              endIndex: 189,
+                              textRun: {
+                                content: 'dedicated QA support',
+                                textStyle: { underline: true },
+                              },
+                            },
+                            {
+                              startIndex: 189,
+                              endIndex: 218,
+                              textRun: { content: ' per sprint by our dev team.\n' },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        {
+          startIndex: 220,
+          endIndex: 250,
+          paragraph: {
+            elements: [
+              {
+                startIndex: 220,
+                endIndex: 248,
+                textRun: { content: 'System Performance Metrics: ' },
+              },
+              {
+                startIndex: 248,
+                endIndex: 249,
+                inlineObjectElement: { inlineObjectId: 'kix.chart1' },
+              },
+              {
+                startIndex: 249,
+                endIndex: 250,
+                textRun: { content: '\n' },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    inlineObjects: {
+      'kix.chart1': {
+        inlineObjectProperties: {
+          embeddedObject: {
+            title: 'System Performance Metrics',
+            description: 'Architecture throughput benchmarks over 12 months',
+            imageProperties: { contentUri: 'https://example.com/performance-chart.png' },
+            size: { width: { magnitude: 400 }, height: { magnitude: 250 } },
+          },
+        },
+      },
+    },
+  };
+}
+

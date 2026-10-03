@@ -10,8 +10,14 @@ import {
   GAP,
   collectSuggestionIds,
   findComment,
+  getImagesInRange,
+  getParagraphsInRange,
+  getRunsInRange,
+  getTableContext,
+  getTablesInRange,
   getTab,
   paragraphIndexAt,
+  renderAnnotatedText,
   renderText,
   resolveCommentAnchor,
   searchText,
@@ -23,11 +29,22 @@ import {
 } from './docModel.js';
 import {
   EditValidationError,
+  buildBulletsRequest,
+  buildDeleteTableColumnRequest,
+  buildDeleteTableRowRequest,
+  buildInsertImageRequest,
+  buildInsertTableColumnRequest,
+  buildInsertTableRowRequest,
+  buildInsertTableRequest,
   buildReplaceRequests,
+  buildUpdateParagraphStyleRequest,
+  buildUpdateTextStyleRequest,
+  hasStyle,
   planRangeEdit,
   sortEditsDescending,
   type DocsRequest,
   type PlannedEdit,
+  type TextStyleInput,
 } from './edits.js';
 import { DocCache, apiErrorMessage, httpStatus, parseDocumentId, type DocsBackend } from './docsClient.js';
 
@@ -63,6 +80,30 @@ const revisionIdSchema = z
   .optional()
   .describe('Optional revisionId you read the indices from. The edit is rejected if the document has changed since.');
 
+const textStyleSchema = z
+  .object({
+    bold: z.boolean().optional().describe('Whether the text is rendered as bold.'),
+    italic: z.boolean().optional().describe('Whether the text is italicized.'),
+    underline: z.boolean().optional().describe('Whether the text is underlined.'),
+    strikethrough: z.boolean().optional().describe('Whether the text is struck through.'),
+    fontSize: z.number().positive().optional().describe('Font size in points (e.g. 11, 12, 14).'),
+    foregroundColor: z.string().optional().describe('Hex color string (e.g. "#FF0000" or "#000000").'),
+    backgroundColor: z.string().optional().describe('Hex background color string.'),
+    linkUrl: z.string().url().optional().describe('Hyperlink URL.'),
+  })
+  .optional()
+  .describe('Explicit text formatting options.');
+
+const paragraphBorderSchema = z
+  .object({
+    padding: z.number().min(0).optional().describe('Border padding in points.'),
+    width: z.number().min(0).optional().describe('Border width in points (0 removes border).'),
+    dashStyle: z.enum(['SOLID', 'DOT', 'DASH']).optional().describe('Border dash style.'),
+    color: z.string().optional().describe('Hex border color string (e.g. "#000000").'),
+  })
+  .optional()
+  .describe('Paragraph border settings.');
+
 function ok(payload: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
 }
@@ -94,7 +135,7 @@ function toDocsApiError(e: unknown): DocsApiError {
   }
   let hint = '';
   if (status === 401) hint = ' Credentials are invalid or expired; re-run `npm run auth`.';
-  else if (status === 403) hint = ' Check that the authorised account can edit/comment on this document, and that your Cloud project is enrolled in the Google Workspace Developer Preview (required for comments & suggestion-mode APIs).';
+  else if (status === 403) hint = ' Check that the authorised account can edit/comment on this document, and that the account has permissions.';
   else if (status === 404) hint = ' Document not found or not shared with the authorised account.';
   return new DocsApiError(`Google Docs API error${status ? ` ${status}` : ''}: ${msg}.${hint}`, status);
 }
@@ -158,12 +199,54 @@ function anchorSummary(model: DocModel, c: CommentInfo) {
 }
 
 // ---------------------------------------------------------------------------
-// Mutation plumbing
+// Mutation Helpers
 // ---------------------------------------------------------------------------
 
-interface BatchOutcome {
-  response: docs_v1.Schema$BatchUpdateDocumentResponse;
-  newRevisionId?: string;
+function checkRevision(m: DocModel, expected?: string): void {
+  if (expected && m.revisionId && m.revisionId !== expected) {
+    throw new DocsApiError(
+      `Revision mismatch: you based this edit on revision ${expected}, but the current document revision is ${m.revisionId}. Re-read the document to obtain fresh indices.`,
+      400,
+      true,
+    );
+  }
+}
+
+function writeControlFor(ctx: ToolContext, model: DocModel, mode?: 'SUGGEST' | 'EDIT'): docs_v1.Schema$WriteControl {
+  const wc: docs_v1.Schema$WriteControl = {};
+  if (mode === 'SUGGEST') wc.writeMode = 'SUGGEST';
+  else if (mode === 'EDIT') wc.writeMode = 'EDIT';
+  if (ctx.requireRevision && model.revisionId) wc.requiredRevisionId = model.revisionId;
+  return wc;
+}
+
+function commentReplyRequest(commentId: string, content?: string, action?: 'RESOLVE' | 'REOPEN'): DocsRequest {
+  const post: Record<string, unknown> = {};
+  if (content) post.content = content;
+  if (action === 'RESOLVE') post.commentAction = 'RESOLVE';
+  else if (action === 'REOPEN') post.commentAction = 'REOPEN';
+  return { addCommentReply: { commentId, post } };
+}
+
+function commentEditRange(
+  model: DocModel,
+  commentId: string,
+): { comment: CommentInfo; tab: TabModel; range: IndexRange } {
+  const comment = findComment(model, commentId);
+  const a = resolveCommentAnchor(model, comment);
+  if (!a) {
+    throw new EditValidationError(
+      comment.anchorId
+        ? `Comment "${commentId}" is anchored to text that no longer exists in the document.`
+        : `Comment "${commentId}" is a document-level comment without anchored text. Use doc_suggest_edit_range instead.`,
+    );
+  }
+  if (!a.merged) {
+    throw new EditValidationError(
+      `Comment "${commentId}" spans non-contiguous ranges (${a.ranges.map((r) => `[${r.startIndex}, ${r.endIndex})`).join(', ')}). Edit each range separately with doc_suggest_edit_range.`,
+    );
+  }
+  return { comment, tab: a.tab, range: a.merged };
 }
 
 async function runBatch(
@@ -171,122 +254,51 @@ async function runBatch(
   documentId: string,
   requests: DocsRequest[],
   writeControl?: docs_v1.Schema$WriteControl,
-): Promise<BatchOutcome> {
+): Promise<{ response: docs_v1.Schema$BatchUpdateDocumentResponse; newRevisionId?: string }> {
   try {
-    const response = await ctx.backend.batchUpdate(documentId, requests, writeControl);
-    return { response, newRevisionId: response.writeControl?.requiredRevisionId ?? undefined };
+    const res = await ctx.backend.batchUpdate(documentId, requests, writeControl);
+    const newRev = res.writeControl?.requiredRevisionId ?? (res as any).revisionId;
+    ctx.cache.invalidate(documentId);
+    return { response: res, newRevisionId: newRev };
   } catch (e) {
     throw toDocsApiError(e);
-  } finally {
-    // Content and/or comments changed (or state is unknown): drop the cached model.
-    ctx.cache.invalidate(documentId);
   }
 }
 
-interface CombinedOutcome extends BatchOutcome {
-  atomic: boolean;
-  commentsApplied: boolean;
-  warnings: string[];
-}
-
-/**
- * Applies content edits and comment operations in ONE batchUpdate when possible.
- * Falls back to two sequential requests if the API rejects the combination
- * (nothing is applied when a batch is rejected, so the retry is safe) or if it
- * reports that the comment part failed.
- */
 async function runContentWithComments(
   ctx: ToolContext,
   documentId: string,
   contentReqs: DocsRequest[],
   commentReqs: DocsRequest[],
   writeControl: docs_v1.Schema$WriteControl,
-): Promise<CombinedOutcome> {
+): Promise<{
+  response: docs_v1.Schema$BatchUpdateDocumentResponse;
+  newRevisionId?: string;
+  commentsApplied: boolean;
+  atomic: boolean;
+  warnings: string[];
+}> {
   const warnings: string[] = [];
-  if (commentReqs.length === 0) {
-    const out = await runBatch(ctx, documentId, contentReqs, writeControl);
-    return { ...out, atomic: true, commentsApplied: false, warnings };
-  }
-  let out: BatchOutcome;
   try {
-    out = await runBatch(ctx, documentId, [...contentReqs, ...commentReqs], writeControl);
+    const combined = [...contentReqs, ...commentReqs];
+    const out = await runBatch(ctx, documentId, combined, writeControl);
+    return { ...out, commentsApplied: commentReqs.length > 0, atomic: true, warnings };
   } catch (e) {
-    const err = toDocsApiError(e);
-    if (err.revisionMismatch || err.status !== 400) throw err;
-    out = await runBatch(ctx, documentId, contentReqs, writeControl);
-    warnings.push(`Combined edit+comment request was rejected (${err.message}); edits and comment updates were applied as separate requests.`);
-    try {
-      const c = await runBatch(ctx, documentId, commentReqs);
-      const failed = (c.response as any).commentUpdateState === 'ALL_FAILED_UNKNOWN_REASON';
-      if (failed) warnings.push('Comment update failed (commentUpdateState=ALL_FAILED_UNKNOWN_REASON).');
-      return { ...out, newRevisionId: c.newRevisionId ?? out.newRevisionId, atomic: false, commentsApplied: !failed, warnings };
-    } catch (e2) {
-      warnings.push(`Comment update failed: ${toDocsApiError(e2).message}`);
-      return { ...out, atomic: false, commentsApplied: false, warnings };
-    }
-  }
-  if ((out.response as any).commentUpdateState === 'ALL_FAILED_UNKNOWN_REASON') {
-    warnings.push('Edits applied but the comment update in the same batch failed; retried separately.');
-    try {
-      const c = await runBatch(ctx, documentId, commentReqs);
-      const failed = (c.response as any).commentUpdateState === 'ALL_FAILED_UNKNOWN_REASON';
-      if (failed) warnings.push('Comment update retry also failed.');
-      return { ...out, newRevisionId: c.newRevisionId ?? out.newRevisionId, atomic: false, commentsApplied: !failed, warnings };
-    } catch (e2) {
-      warnings.push(`Comment update retry failed: ${toDocsApiError(e2).message}`);
-      return { ...out, atomic: false, commentsApplied: false, warnings };
-    }
-  }
-  return { ...out, atomic: true, commentsApplied: true, warnings };
-}
+    if (commentReqs.length === 0) throw e;
+    const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+    const commentRelated = /comment|developer preview|forbidden|403|unsupported/i.test(msg);
+    if (!commentRelated) throw e;
 
-function writeControlFor(ctx: ToolContext, model: DocModel, writeMode?: 'SUGGEST' | 'EDIT'): docs_v1.Schema$WriteControl {
-  const wc: docs_v1.Schema$WriteControl = {};
-  if (writeMode) wc.writeMode = writeMode;
-  if (ctx.requireRevision && model.revisionId) wc.requiredRevisionId = model.revisionId;
-  return wc;
-}
-
-function checkRevision(model: DocModel, revisionId?: string): void {
-  if (revisionId && model.revisionId && revisionId !== model.revisionId) {
-    throw new EditValidationError(
-      `Document has changed since revision ${revisionId} (current: ${model.revisionId}); the indices you hold may be stale. Re-read the target text, or pass expectedText instead of revisionId.`,
+    warnings.push(
+      `Comment update could not be applied in the same batch (${apiErrorMessage(e)}). Applying text edits separately.`,
     );
+    const out = await runBatch(ctx, documentId, contentReqs, writeControl);
+    return { ...out, commentsApplied: false, atomic: false, warnings };
   }
-}
-
-function commentReplyRequest(commentId: string, content: string | undefined, action?: 'RESOLVE' | 'REOPEN'): DocsRequest {
-  const post: Record<string, string> = {};
-  if (content) post.content = content;
-  if (action) post.commentAction = action;
-  return { addCommentReply: { commentId, post } };
-}
-
-/** Resolves a comment's anchor to a single editable range, or throws. */
-function commentEditRange(model: DocModel, commentId: string): { comment: CommentInfo; tab: TabModel; range: IndexRange } {
-  const comment = findComment(model, commentId);
-  const a = resolveCommentAnchor(model, comment);
-  if (!a) {
-    throw new EditValidationError(
-      `Comment ${commentId} has no resolvable text anchor (${comment.anchorId ? 'anchor no longer in document' : 'document-level comment'}). ` +
-        `Locate the text with doc_search_text and use doc_suggest_edit_range instead.`,
-    );
-  }
-  if (!a.merged) {
-    throw new EditValidationError(
-      `Comment ${commentId} is anchored to ${a.ranges.length} disjoint ranges (${a.ranges
-        .map((r) => `[${r.startIndex},${r.endIndex})`)
-        .join(', ')}). Edit them individually with doc_suggest_edit_range or doc_batch_suggest_edits.`,
-    );
-  }
-  if (a.merged.endIndex <= a.merged.startIndex) {
-    throw new EditValidationError(`Comment ${commentId} has an empty anchor; nothing to replace.`);
-  }
-  return { comment, tab: a.tab, range: a.merged };
 }
 
 // ---------------------------------------------------------------------------
-// Registration
+// Tool Registrations
 // ---------------------------------------------------------------------------
 
 export function registerTools(server: McpServer, ctx: ToolContext): void {
@@ -300,7 +312,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get document metadata',
       description:
-        'Quick, text-free status check of a Google Doc: title, revisionId, tabs, character counts, comment counts (total/open/resolved) and pending suggestion count. Use refresh=true to force a full re-fetch.',
+        'Quick, text-free status check of a Google Doc: title, revisionId, tabs, character counts, table counts, image counts, comment counts, and pending suggestion counts. Use refresh=true to force a full re-fetch.',
       inputSchema: {
         documentId: documentIdSchema,
         refresh: z.boolean().optional().describe('Bypass the cache and re-fetch the document.'),
@@ -315,11 +327,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       }
       const m = await ctx.cache.get(id);
       const charCount = (t: TabModel) => t.text.length - (t.text.split(GAP).length - 1);
+
       return ok({
         documentId: m.documentId,
         title: m.title,
         revisionId: m.revisionId,
         characterCount: m.tabs.reduce((n, t) => n + charCount(t), 0),
+        tableCount: m.tabs.reduce((n, t) => n + t.tables.length, 0),
+        imageCount: m.tabs.reduce((n, t) => n + t.images.length, 0),
         tabs: m.tabs.map((t) => ({
           tabId: t.tabId || undefined,
           title: t.title || undefined,
@@ -327,6 +342,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           endIndex: t.endIndex,
           characterCount: charCount(t),
           headings: t.outline.length,
+          tables: t.tables.length,
+          images: t.images.length,
         })),
         comments: m.commentsAvailable
           ? {
@@ -369,42 +386,50 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'List comments',
       description:
-        'Surveys comment threads with their author, status, feedback text, current anchor text and exact global startIndex/endIndex. Start every review workflow here. Sorted by position in the document; unanchored comments last.',
+        'Surveys all comments in the document. Returns compact summaries (author, status, anchor text, content snippet, and exact [startIndex, endIndex) coordinates). Prefer status="OPEN" to find unresolved feedback.',
       inputSchema: {
         documentId: documentIdSchema,
-        status: z.enum(['OPEN', 'RESOLVED', 'ALL']).optional().describe('Filter by thread status (default OPEN).'),
-        includeReplies: z.boolean().optional().describe('Include reply text (default false: only replyCount).'),
-        maxContentChars: z.number().int().min(20).max(4000).optional().describe('Truncate feedback/anchor text (default 300).'),
+        status: z.enum(['OPEN', 'RESOLVED', 'ALL']).optional().describe('Default "OPEN".'),
+        tabId: tabIdSchema.describe('Only return comments anchored in this tab (omit for all tabs).'),
+        maxResults: z.number().int().min(1).max(500).optional().describe('Default 100.'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, status, includeReplies, maxContentChars }) => {
+    safe(async ({ documentId, status, tabId, maxResults }) => {
       const m = await load(documentId);
-      if (!m.commentsAvailable) return fail(`Comments are not available: ${m.commentsUnavailableReason}`);
-      const want = status ?? 'OPEN';
-      const max = maxContentChars ?? 300;
-      const rows = m.comments
-        .filter((c) => want === 'ALL' || c.status === want)
-        .map((c) => {
-          const a = anchorSummary(m, c);
-          return {
-            commentId: c.commentId,
-            author: c.head.author,
-            status: c.status,
-            anchorText: a.anchorText !== undefined ? truncate(a.anchorText, max) : undefined,
-            startIndex: a.anchored ? a.startIndex : undefined,
-            endIndex: a.anchored ? a.endIndex : undefined,
-            tabId: a.anchored && a.tab.tabId && m.tabs.length > 1 ? a.tab.tabId : undefined,
-            anchorStatus: a.anchored ? (a.contiguous ? undefined : 'multiple_ranges') : a.anchorStatus,
-            content: truncate(c.head.content, max),
-            replyCount: c.replies.length,
-            replies: includeReplies
-              ? c.replies.map((r) => ({ author: r.author, content: truncate(r.content, max), action: r.commentAction }))
-              : undefined,
-          };
-        })
-        .sort((x, y) => (x.startIndex ?? Number.MAX_SAFE_INTEGER) - (y.startIndex ?? Number.MAX_SAFE_INTEGER));
-      return ok({ revisionId: m.revisionId, total: rows.length, comments: rows });
+      if (!m.commentsAvailable) {
+        return ok({
+          available: false,
+          reason: m.commentsUnavailableReason,
+          comments: [],
+          hint: 'Comments require an authenticated Google account with access to the document.',
+        });
+      }
+      const st = status ?? 'OPEN';
+      const max = maxResults ?? 100;
+      const rows: any[] = [];
+      for (const c of m.comments) {
+        if (st !== 'ALL' && c.status !== st) continue;
+        const a = anchorSummary(m, c);
+        if (tabId && a.anchored && a.tab.tabId !== tabId) continue;
+        rows.push({
+          commentId: c.commentId,
+          status: c.status,
+          author: c.head.author,
+          createTime: c.head.createTime,
+          content: truncate(c.head.content, 400),
+          replyCount: c.replies.length,
+          lastReply: c.replies.length ? truncate(c.replies[c.replies.length - 1].content, 200) : undefined,
+          anchored: a.anchored,
+          anchorStatus: a.anchorStatus,
+          tabId: a.anchored && m.tabs.length > 1 ? a.tab.tabId : undefined,
+          startIndex: a.startIndex,
+          endIndex: a.endIndex,
+          anchorText: a.anchorText ? truncate(a.anchorText, 200) : undefined,
+        });
+        if (rows.length >= max) break;
+      }
+      return ok({ revisionId: m.revisionId, totalMatched: rows.length, comments: rows });
     }),
   );
 
@@ -413,30 +438,37 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Search document text',
       description:
-        'Finds occurrences of a term/phrase in the cached document text without dumping content into context. Returns exact global startIndex/endIndex, the exact matched text (usable as expectedText) and ~40 chars of preview on each side.',
+        'Finds exact-string matches across the document text buffer without downloading full text. Returns the exact startIndex and endIndex for every occurrence, plus a surrounding 80-character snippet with <match>…</match> tags. ALWAYS use this to obtain fresh indices before editing.',
       inputSchema: {
         documentId: documentIdSchema,
-        query: z.string().min(1),
-        maxResults: z.number().int().min(1).max(50).optional().describe('Default 5.'),
-        caseSensitive: z.boolean().optional().describe('Default false.'),
+        query: z.string().min(1).describe('The search needle (plain text).'),
         tabId: tabIdSchema,
+        caseSensitive: z.boolean().optional().describe('Default false.'),
+        maxResults: z.number().int().min(1).max(100).optional().describe('Default 5.'),
+        previewRadius: z.number().int().min(10).max(300).optional().describe('Surrounding chars on each side (default 40).'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, query, maxResults, caseSensitive, tabId }) => {
+    safe(async ({ documentId, query, tabId, caseSensitive, maxResults, previewRadius }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
-      const r = searchText(tab, query, { caseSensitive, maxResults: maxResults ?? 5 });
+      const max = maxResults ?? 5;
+      const radius = previewRadius ?? 40;
+      const res = searchText(tab, query, { caseSensitive, maxResults: max });
       return ok({
         revisionId: m.revisionId,
-        totalMatches: r.totalMatches,
-        totalCapped: r.totalCapped || undefined,
-        matches: r.matches.map((x) => ({
-          startIndex: x.startIndex,
-          endIndex: x.endIndex,
-          text: tab.text.slice(x.startIndex, x.endIndex),
-          preview: preview(tab, x.startIndex, x.endIndex, 40, 'match'),
-        })),
+        tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
+        query,
+        totalMatches: res.totalMatches,
+        matches: res.matches.map((r) => {
+          const prev = preview(tab, r.startIndex, r.endIndex, radius, 'match');
+          return {
+            startIndex: r.startIndex,
+            endIndex: r.endIndex,
+            snippet: prev,
+            preview: prev,
+          };
+        }),
       });
     }),
   );
@@ -503,10 +535,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         surroundingParagraphs: z.number().int().min(0).max(5).optional().describe('Non-empty paragraphs before/after the anchor (default 1).'),
         maxContextChars: z.number().int().min(50).max(5000).optional().describe('Max context characters on each side of the anchor (default 1200).'),
         markSuggestions: z.boolean().optional().describe('Show pending suggestions as [-deleted-]/{+inserted+} (default true).'),
+        includeRuns: z.boolean().optional().describe('Include detailed styled runs array for the anchor text (default false to save tokens).'),
+        includeParagraphStyle: z.boolean().optional().describe('Include paragraph style/spacing metadata for the anchor (default false).'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, commentId, surroundingParagraphs, maxContextChars, markSuggestions }) => {
+    safe(async ({ documentId, commentId, surroundingParagraphs, maxContextChars, markSuggestions, includeRuns, includeParagraphStyle }) => {
       const m = await load(documentId);
       const c = findComment(m, commentId);
       const a = resolveCommentAnchor(m, c);
@@ -556,6 +590,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         `<target>${target}</target>` +
         renderText(tab, e, ce, mark) +
         (clippedEnd ? '…' : '');
+
+      const anchorRuns = includeRuns ? getRunsInRange(tab, s, e) : undefined;
+      const tblCtx = getTableContext(tab, s);
+      const paraStyle = includeParagraphStyle && ps[i] ? ps[i].style : undefined;
+
       return ok({
         ...thread,
         revisionId: m.revisionId,
@@ -565,8 +604,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           text: renderText(tab, s, e),
           tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
           ranges: a.ranges.length > 1 ? a.ranges : undefined,
+          runs: anchorRuns && anchorRuns.length ? anchorRuns : undefined,
+          paragraphStyle: paraStyle || undefined,
         },
         context: { contextStartIndex: cs, contextEndIndex: ce, snippet },
+        tableContext: tblCtx || undefined,
       });
     }),
   );
@@ -576,43 +618,109 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Read text range',
       description:
-        'Reads plain text strictly between global startIndex (inclusive) and endIndex (exclusive), preserving line breaks. Indices are never re-based. Large ranges are truncated at 20,000 chars with nextStartIndex for paging.',
+        'Reads text strictly between global startIndex (inclusive) and endIndex (exclusive). By default (includeFormatting=true), returns both raw plain text and rich Markdown annotatedText (bold, italic, underline, strikethrough, images), plus structured styled runs, and table context if inside a table. Large ranges are truncated at 20,000 chars.',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
         endIndex: indexSchema,
         tabId: tabIdSchema,
+        includeFormatting: z.boolean().optional().describe('Master toggle for rich formatting. If false, returns raw plain text only (default true).'),
+        includeAnnotatedText: z.boolean().optional().describe('Include Markdown annotatedText with **bold**, *italic*, <u>underline</u>, ~~strike~~, and links. Very low token cost (default true when formatting is enabled).'),
+        includeRuns: z.boolean().optional().describe('Include verbose styled runs array with exact coordinates and style objects. Set true only when you need exact index bounds for individual style spans (default false to save tokens).'),
+        includeParagraphs: z.boolean().optional().describe('Include verbose paragraph layout/styling objects (spacing, margins, borders, padding). Set true only when inspecting or adjusting paragraph layout (default false to save tokens).'),
+        includeTables: z.boolean().optional().describe('Include table structure and coordinates if range intersects tables (default true).'),
+        includeImages: z.boolean().optional().describe('Include inline image metadata if present (default true).'),
         markSuggestions: z.boolean().optional().describe('Show pending suggestions as [-deleted-]/{+inserted+} (default false).'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, startIndex, endIndex, tabId, markSuggestions }) => {
+    safe(async ({
+      documentId,
+      startIndex,
+      endIndex,
+      tabId,
+      includeFormatting,
+      includeAnnotatedText,
+      includeRuns,
+      includeParagraphs,
+      includeTables,
+      includeImages,
+      markSuggestions,
+    }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
       if (endIndex < startIndex) return fail('endIndex must be >= startIndex.');
       if (startIndex >= tab.endIndex) return fail(`startIndex ${startIndex} is beyond the end of the tab (${tab.endIndex}).`);
       const end = Math.min(endIndex, tab.endIndex, startIndex + MAX_READ_CHARS);
       const truncated = end < Math.min(endIndex, tab.endIndex);
-      return ok({
+      const plainText = renderText(tab, startIndex, end, !!markSuggestions);
+
+      const formatting = includeFormatting !== false;
+      const res: Record<string, any> = {
         revisionId: m.revisionId,
         tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
         startIndex,
         endIndex: end,
-        text: renderText(tab, startIndex, end, !!markSuggestions),
-        truncated: truncated || undefined,
-        nextStartIndex: truncated ? end : undefined,
-      });
+        text: plainText,
+      };
+
+      if (formatting) {
+        if (includeAnnotatedText !== false) {
+          res.annotatedText = renderAnnotatedText(tab, startIndex, end, !!markSuggestions);
+        }
+        if (includeRuns === true) {
+          const runs = getRunsInRange(tab, startIndex, end);
+          if (runs.length) res.runs = runs;
+        }
+        const tblContext = getTableContext(tab, startIndex);
+        if (tblContext) res.tableContext = tblContext;
+        if (includeTables !== false) {
+          const tablesInRange = getTablesInRange(tab, startIndex, end);
+          if (tablesInRange.length) {
+            res.tables = tablesInRange.map((t) => ({
+              tableIndex: t.tableIndex,
+              rows: t.rows,
+              columns: t.columns,
+              startIndex: t.startIndex,
+              endIndex: t.endIndex,
+            }));
+          }
+        }
+        if (includeImages !== false) {
+          const imagesInRange = getImagesInRange(tab, startIndex, end);
+          if (imagesInRange.length) res.images = imagesInRange;
+        }
+        if (includeParagraphs === true) {
+          const paragraphsInRange = getParagraphsInRange(tab, startIndex, end);
+          if (paragraphsInRange.length) {
+            res.paragraphs = paragraphsInRange.map((p) => ({
+              startIndex: p.startIndex,
+              endIndex: p.endIndex,
+              namedStyleType: p.namedStyleType,
+              alignment: p.alignment,
+              hasBullet: p.hasBullet,
+              inTable: p.inTable,
+              style: p.style,
+              tableContext: p.tableContext,
+            }));
+          }
+        }
+      }
+
+      if (truncated) res.truncated = true;
+      if (truncated) res.nextStartIndex = end;
+      return ok(res);
     }),
   );
 
-  // ---- Category C: Safe mutation & suggestions ----------------------------
+  // ---- Category C: Safe mutation, formatting & structure ------------------
 
   server.registerTool(
     'doc_suggest_comment_revision',
     {
       title: 'Suggest revision for a comment',
       description:
-        "PREFERRED tool for addressing comments. Atomically proposes a suggested revision in Google Docs suggestion mode for exactly the text anchored by commentId, and (by default) marks the comment thread resolved — all in a single batchUpdate. Preserves track changes for user review. suggestedText replaces only the anchored text, so match the surrounding sentence's grammar, spacing and punctuation.",
+        "PREFERRED tool for addressing comments. Atomically proposes a suggested revision in Google Docs suggestion mode for exactly the text anchored by commentId, and (by default) marks the comment thread resolved — all in a single batchUpdate. Optionally specify textStyle.",
       inputSchema: {
         documentId: documentIdSchema,
         commentId: z.string().min(1),
@@ -623,14 +731,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           .max(2048)
           .optional()
           .describe(`Reply posted to the thread. Default when resolving: "${DEFAULT_RESOLVE_REPLY}"`),
+        textStyle: textStyleSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    safe(async ({ documentId, commentId, suggestedText, resolveComment, replyMessage }) => {
+    safe(async ({ documentId, commentId, suggestedText, resolveComment, replyMessage, textStyle }) => {
       const id = parseDocumentId(documentId);
       const m = await ctx.cache.get(id, true);
       const { comment, tab, range } = commentEditRange(m, commentId);
-      const planned = planRangeEdit(tab, { ...range, text: suggestedText });
+      const planned = planRangeEdit(tab, { ...range, text: suggestedText, textStyle });
       const resolve = resolveComment !== false;
       const commentReqs: DocsRequest[] = [];
       if (resolve) commentReqs.push(commentReplyRequest(commentId, replyMessage ?? DEFAULT_RESOLVE_REPLY, 'RESOLVE'));
@@ -650,6 +759,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         commentId,
         replaced: { startIndex: planned.startIndex, endIndex: planned.endIndex, originalText: truncate(planned.originalText, 500) },
         suggestedText: planned.text,
+        appliedStyle: planned.textStyle,
         createdSuggestionIds: suggestionIdsFrom(out.response, 'createdSuggestionIds'),
         commentResolved: resolve && out.commentsApplied,
         replyPosted: commentReqs.length > 0 && out.commentsApplied,
@@ -670,18 +780,29 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         expectedText?: string;
         revisionId?: string;
         tabId?: string;
+        textStyle?: TextStyleInput;
       }) => {
         const id = parseDocumentId(args.documentId);
         const m = await ctx.cache.get(id, true);
         checkRevision(m, args.revisionId);
         const tab = getTab(m, args.tabId);
-        const planned = planRangeEdit(tab, { startIndex: args.startIndex, endIndex: args.endIndex, text: args.text }, args.expectedText);
+        const planned = planRangeEdit(
+          tab,
+          {
+            startIndex: args.startIndex,
+            endIndex: args.endIndex,
+            text: args.text,
+            textStyle: args.textStyle,
+          },
+          args.expectedText,
+        );
         const out = await runBatch(ctx, id, buildReplaceRequests(tab, planned), writeControlFor(ctx, m, mode));
         return ok({
           status: 'ok',
           mode,
           replaced: { startIndex: planned.startIndex, endIndex: planned.endIndex, originalText: truncate(planned.originalText, 500) },
           newText: planned.text,
+          appliedStyle: planned.textStyle,
           createdSuggestionIds: mode === 'SUGGEST' ? suggestionIdsFrom(out.response, 'createdSuggestionIds') : undefined,
           newRevisionId: out.newRevisionId,
           warnings: planned.notes.length ? planned.notes : undefined,
@@ -695,13 +816,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Suggest edit for a range',
       description:
-        'Submits a suggested revision (tracked change) replacing [startIndex, endIndex) with suggestedText. The old text appears struck-through and the new text in suggestion styling in Google Docs. Use startIndex == endIndex for a pure insertion, or empty suggestedText for a pure deletion. Take indices from doc_search_text / doc_read_comment_context and pass expectedText.',
+        'Submits a suggested revision (tracked change) replacing [startIndex, endIndex) with suggestedText. Optionally format the suggested text using textStyle (bold, italic, underline, strikethrough, etc.).',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
         endIndex: indexSchema,
         suggestedText: z.string(),
         expectedText: expectedTextSchema,
+        textStyle: textStyleSchema,
         revisionId: revisionIdSchema,
         tabId: tabIdSchema,
       },
@@ -716,13 +838,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Apply DIRECT edit (no suggestion)',
       description:
-        'DIRECTLY overwrites [startIndex, endIndex) with newText, bypassing suggestion mode (no tracked change). Use ONLY when the user explicitly asks to "overwrite directly", "not use suggestions" or "make definitive edits". Otherwise use doc_suggest_edit_range.',
+        'DIRECTLY overwrites [startIndex, endIndex) with newText, bypassing suggestion mode (no tracked change). Optionally format the new text using textStyle. Use ONLY when the user explicitly asks to "overwrite directly".',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
         endIndex: indexSchema,
         newText: z.string(),
         expectedText: expectedTextSchema,
+        textStyle: textStyleSchema,
         revisionId: revisionIdSchema,
         tabId: tabIdSchema,
       },
@@ -736,7 +859,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Batch suggest edits',
       description:
-        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId (its anchored text; thread resolved by default) or an explicit [startIndex, endIndex) range from the same document state. The server sorts edits bottom-to-top (descending startIndex) so indices never drift, and rejects overlapping edits.',
+        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId or an explicit [startIndex, endIndex) range, with optional textStyle. The server sorts edits bottom-to-top so indices never drift.',
       inputSchema: {
         documentId: documentIdSchema,
         edits: z
@@ -747,6 +870,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
               endIndex: indexSchema.optional(),
               expectedText: expectedTextSchema,
               suggestedText: z.string(),
+              textStyle: textStyleSchema,
             }),
           )
           .min(1)
@@ -779,7 +903,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (tab && t !== tab) throw new EditValidationError('All edits in one batch must target the same document tab.');
         tab = t;
         try {
-          planned.push({ ...planRangeEdit(t, { ...range, text: e.suggestedText }, e.expectedText), item, commentId: e.commentId });
+          planned.push({
+            ...planRangeEdit(
+              t,
+              {
+                ...range,
+                text: e.suggestedText,
+                textStyle: e.textStyle,
+              },
+              e.expectedText,
+            ),
+            item,
+            commentId: e.commentId,
+          });
         } catch (err) {
           if (err instanceof EditValidationError) throw new EditValidationError(`edits[${item}]: ${err.message}`);
           throw err;
@@ -808,6 +944,481 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       });
     }),
   );
+
+  // ---- Category D: Rich text formatting & Elements ------------------------
+
+  server.registerTool(
+    'doc_format_text',
+    {
+      title: 'Format text style',
+      description:
+        'Applies text formatting (bold, italic, underline, strikethrough, fontSize, colors, link) to a range [startIndex, endIndex). Can run in SUGGEST mode (tracked formatting suggestion) or EDIT mode (direct formatting).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        startIndex: indexSchema,
+        endIndex: indexSchema,
+        tabId: tabIdSchema,
+        bold: z.boolean().optional().describe('Bold styling.'),
+        italic: z.boolean().optional().describe('Italic styling.'),
+        underline: z.boolean().optional().describe('Underline styling.'),
+        strikethrough: z.boolean().optional().describe('Strikethrough styling.'),
+        fontSize: z.number().positive().optional().describe('Font size in points.'),
+        foregroundColor: z.string().optional().describe('Hex color string (e.g. "#FF0000").'),
+        backgroundColor: z.string().optional().describe('Hex background color string.'),
+        linkUrl: z.string().url().optional().describe('Hyperlink URL.'),
+        textStyle: textStyleSchema
+          .optional()
+          .describe('Optional textStyle object (can be used instead of or in addition to individual style fields).'),
+        writeMode: z
+          .enum(['SUGGEST', 'EDIT'])
+          .optional()
+          .describe('SUGGEST (default) proposes a tracked suggestion; EDIT applies directly.'),
+        expectedText: expectedTextSchema,
+        revisionId: revisionIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(
+      async ({
+        documentId,
+        startIndex,
+        endIndex,
+        tabId,
+        bold,
+        italic,
+        underline,
+        strikethrough,
+        fontSize,
+        foregroundColor,
+        backgroundColor,
+        linkUrl,
+        textStyle,
+        writeMode,
+        expectedText,
+        revisionId,
+      }) => {
+        const id = parseDocumentId(documentId);
+        const m = await ctx.cache.get(id, true);
+        checkRevision(m, revisionId);
+        const tab = getTab(m, tabId);
+        if (startIndex < 1 || endIndex <= startIndex || endIndex > tab.endIndex) {
+          return fail(`Invalid range [${startIndex}, ${endIndex}) for tab ending at ${tab.endIndex}.`);
+        }
+        if (expectedText !== undefined) {
+          const actual = tab.text.slice(startIndex, endIndex);
+          if (actual !== expectedText) {
+            return fail(
+              `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
+                truncate(actual, 300),
+              )}.`,
+            );
+          }
+        }
+        const explicitStyle: TextStyleInput = { ...textStyle };
+        if (bold !== undefined) explicitStyle.bold = bold;
+        if (italic !== undefined) explicitStyle.italic = italic;
+        if (underline !== undefined) explicitStyle.underline = underline;
+        if (strikethrough !== undefined) explicitStyle.strikethrough = strikethrough;
+        if (fontSize !== undefined) explicitStyle.fontSize = fontSize;
+        if (foregroundColor !== undefined) explicitStyle.foregroundColor = foregroundColor;
+        if (backgroundColor !== undefined) explicitStyle.backgroundColor = backgroundColor;
+        if (linkUrl !== undefined) explicitStyle.linkUrl = linkUrl;
+
+        if (!hasStyle(explicitStyle)) {
+          return fail('No formatting styles specified. Provide at least one style property (bold, italic, etc.).');
+        }
+
+        const mode = writeMode ?? 'SUGGEST';
+        const req = buildUpdateTextStyleRequest(
+          { startIndex, endIndex, ...(tab.tabId ? { tabId: tab.tabId } : {}) },
+          explicitStyle,
+        );
+        const out = await runBatch(ctx, id, [req], writeControlFor(ctx, m, mode));
+        return ok({
+          status: 'ok',
+          mode,
+          startIndex,
+          endIndex,
+          styledText: truncate(renderText(tab, startIndex, endIndex), 300),
+          appliedStyle: explicitStyle,
+          createdSuggestionIds: mode === 'SUGGEST' ? suggestionIdsFrom(out.response, 'createdSuggestionIds') : undefined,
+          newRevisionId: out.newRevisionId,
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    'doc_format_paragraph',
+    {
+      title: 'Format paragraph / bullets',
+      description:
+        'Updates paragraph styles (headings, alignment, line spacing) or bullet/numbered lists for paragraphs overlapping [startIndex, endIndex).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        startIndex: indexSchema,
+        endIndex: indexSchema,
+        tabId: tabIdSchema,
+        namedStyleType: z
+          .enum(['NORMAL_TEXT', 'TITLE', 'SUBTITLE', 'HEADING_1', 'HEADING_2', 'HEADING_3', 'HEADING_4', 'HEADING_5', 'HEADING_6'])
+          .optional()
+          .describe('Heading / named style type.'),
+        alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Text alignment.'),
+        bulletPreset: z
+          .enum([
+            'BULLET_DISC_CIRCLE_SQUARE',
+            'BULLET_DIAMONDX_ARROW3D_SQUARE',
+            'BULLET_CHECKBOX',
+            'BULLET_ARROW_CIRCLE_DISC',
+            'NUMBERED_DECIMAL_ALPHA_ROMAN',
+            'NUMBERED_DECIMAL_NESTED',
+          ])
+          .optional()
+          .describe('Bullet or numbering list style to apply.'),
+        removeBullets: z.boolean().optional().describe('Set true to remove bullets/numbering from the range.'),
+        spaceAbove: z.number().min(0).optional().describe('Space above paragraph in points (e.g. 0, 6, 12, 18).'),
+        spaceBelow: z.number().min(0).optional().describe('Space below paragraph in points (e.g. 0, 6, 12).'),
+        lineSpacing: z.number().positive().optional().describe('Line spacing percentage (e.g. 100 for single, 115 for 1.15x, 150 for 1.5x, 200 for double).'),
+        spacingMode: z
+          .enum(['SPACING_MODE_UNSPECIFIED', 'NEVER_COLLAPSE', 'COLLAPSE_LISTS'])
+          .optional()
+          .describe('Spacing mode (e.g. NEVER_COLLAPSE or COLLAPSE_LISTS).'),
+        indentStart: z.number().min(0).optional().describe('Left indentation in points (e.g. 36 for 0.5 inch, 72 for 1 inch).'),
+        indentEnd: z.number().min(0).optional().describe('Right indentation in points.'),
+        indentFirstLine: z.number().optional().describe('First line indentation in points.'),
+        padding: z.number().min(0).optional().describe('Paragraph border padding in points (shorthand across all borders).'),
+        shadingColor: z.string().optional().describe('Hex background color / shading for the paragraph (e.g. "#F0F0F0").'),
+        keepLinesTogether: z.boolean().optional().describe('Keep all lines of paragraph on the same page.'),
+        keepWithNext: z.boolean().optional().describe('Keep paragraph on the same page as the next paragraph.'),
+        avoidWidowAndOrphan: z.boolean().optional().describe('Avoid widow and orphan lines.'),
+        pageBreakBefore: z.boolean().optional().describe('Start paragraph on a new page.'),
+        borderTop: paragraphBorderSchema.describe('Top border settings (padding, width, dashStyle, color).'),
+        borderBottom: paragraphBorderSchema.describe('Bottom border settings.'),
+        borderLeft: paragraphBorderSchema.describe('Left border settings.'),
+        borderRight: paragraphBorderSchema.describe('Right border settings.'),
+        borderBetween: paragraphBorderSchema.describe('Between border settings for adjacent matching paragraphs.'),
+        writeMode: z.enum(['SUGGEST', 'EDIT']).optional().default('EDIT'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(
+      async ({
+        documentId,
+        startIndex,
+        endIndex,
+        tabId,
+        namedStyleType,
+        alignment,
+        bulletPreset,
+        removeBullets,
+        spaceAbove,
+        spaceBelow,
+        lineSpacing,
+        spacingMode,
+        indentStart,
+        indentEnd,
+        indentFirstLine,
+        padding,
+        shadingColor,
+        keepLinesTogether,
+        keepWithNext,
+        avoidWidowAndOrphan,
+        pageBreakBefore,
+        borderTop,
+        borderBottom,
+        borderLeft,
+        borderRight,
+        borderBetween,
+        writeMode,
+      }) => {
+        const id = parseDocumentId(documentId);
+        const m = await ctx.cache.get(id, true);
+        const tab = getTab(m, tabId);
+        if (startIndex < 0 || endIndex <= startIndex || endIndex > tab.endIndex) {
+          return fail(`Invalid range [${startIndex}, ${endIndex}) for tab ending at ${tab.endIndex}.`);
+        }
+
+        const reqs: DocsRequest[] = [];
+        const rangeObj = { startIndex, endIndex, ...(tab.tabId ? { tabId: tab.tabId } : {}) };
+
+        const hasParaStyle =
+          namedStyleType !== undefined ||
+          alignment !== undefined ||
+          spaceAbove !== undefined ||
+          spaceBelow !== undefined ||
+          lineSpacing !== undefined ||
+          spacingMode !== undefined ||
+          indentStart !== undefined ||
+          indentEnd !== undefined ||
+          indentFirstLine !== undefined ||
+          padding !== undefined ||
+          shadingColor !== undefined ||
+          keepLinesTogether !== undefined ||
+          keepWithNext !== undefined ||
+          avoidWidowAndOrphan !== undefined ||
+          pageBreakBefore !== undefined ||
+          borderTop !== undefined ||
+          borderBottom !== undefined ||
+          borderLeft !== undefined ||
+          borderRight !== undefined ||
+          borderBetween !== undefined;
+
+        if (hasParaStyle) {
+          reqs.push(
+            buildUpdateParagraphStyleRequest(rangeObj, {
+              namedStyleType,
+              alignment,
+              spaceAbove,
+              spaceBelow,
+              lineSpacing,
+              spacingMode,
+              indentStart,
+              indentEnd,
+              indentFirstLine,
+              padding,
+              shadingColor,
+              keepLinesTogether,
+              keepWithNext,
+              avoidWidowAndOrphan,
+              pageBreakBefore,
+              borderTop,
+              borderBottom,
+              borderLeft,
+              borderRight,
+              borderBetween,
+            }),
+          );
+        }
+
+        if (bulletPreset || removeBullets) {
+          reqs.push(buildBulletsRequest(rangeObj, bulletPreset, removeBullets));
+        }
+
+        if (reqs.length === 0) {
+          return fail('No paragraph style or bullet options specified.');
+        }
+
+        const mode = writeMode ?? 'EDIT';
+        const out = await runBatch(ctx, id, reqs, writeControlFor(ctx, m, mode));
+        return ok({
+          status: 'ok',
+          mode,
+          startIndex,
+          endIndex,
+          appliedParagraphStyle: hasParaStyle
+            ? {
+                namedStyleType,
+                alignment,
+                spaceAbove,
+                spaceBelow,
+                lineSpacing,
+                spacingMode,
+                indentStart,
+                indentEnd,
+                indentFirstLine,
+                padding,
+                shadingColor,
+                keepLinesTogether,
+                keepWithNext,
+                avoidWidowAndOrphan,
+                pageBreakBefore,
+                borderTop,
+                borderBottom,
+                borderLeft,
+                borderRight,
+                borderBetween,
+              }
+            : undefined,
+          bulletPreset,
+          removeBullets,
+          newRevisionId: out.newRevisionId,
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    'doc_inspect_tables',
+    {
+      title: 'Inspect document tables',
+      description:
+        'Lists all tables in the document (or tab) with their dimensions, index bounds, and matrix of cells (row, column, text, startIndex, endIndex). Essential for navigating and editing tabular sections.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tabId: tabIdSchema,
+        tableIndex: z.number().int().nonnegative().optional().describe('Inspect only this specific table index (0-indexed).'),
+        includeCellText: z
+          .boolean()
+          .optional()
+          .describe('Include cell text contents (default true). Set false to inspect only table dimensions, rows, columns, and index coordinates without text.'),
+      },
+      annotations: RO,
+    },
+    safe(async ({ documentId, tabId, tableIndex, includeCellText }) => {
+      const m = await load(documentId);
+      const tab = getTab(m, tabId);
+      let tables = tab.tables;
+      if (tableIndex !== undefined) {
+        const found = tables.find((t) => t.tableIndex === tableIndex);
+        if (!found) return fail(`Table with index ${tableIndex} not found. Total tables in tab: ${tables.length}.`);
+        tables = [found];
+      }
+      return ok({
+        revisionId: m.revisionId,
+        tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
+        totalTables: tab.tables.length,
+        tables: tables.map((t) => ({
+          tableIndex: t.tableIndex,
+          startIndex: t.startIndex,
+          endIndex: t.endIndex,
+          rows: t.rows,
+          columns: t.columns,
+          cells: t.cells.map((c) => ({
+            row: c.rowIndex,
+            col: c.columnIndex,
+            startIndex: c.startIndex,
+            endIndex: c.endIndex,
+            ...(includeCellText !== false ? { text: c.text } : {}),
+          })),
+        })),
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_insert_table',
+    {
+      title: 'Insert table',
+      description:
+        'Inserts a table with the specified number of rows and columns at index. The table must be inserted inside an existing paragraph (not at index 0 or inside another table).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        index: indexSchema.describe('Document model index to insert the table at.'),
+        rows: z.number().int().min(1).max(100).describe('Number of rows.'),
+        columns: z.number().int().min(1).max(50).describe('Number of columns.'),
+        tabId: tabIdSchema,
+        revisionId: revisionIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, index, rows, columns, tabId, revisionId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      checkRevision(m, revisionId);
+      const tab = getTab(m, tabId);
+      if (index < 1 || index > tab.endIndex) return fail(`Invalid index ${index} for tab ending at ${tab.endIndex}.`);
+      if (tab.text[index] === GAP) return fail(`Cannot insert table at index ${index}: it is a structural marker.`);
+      const req = buildInsertTableRequest({ index, ...(tab.tabId ? { tabId: tab.tabId } : {}) }, rows, columns);
+      const out = await runBatch(ctx, id, [req], writeControlFor(ctx, m, 'EDIT'));
+      return ok({
+        status: 'ok',
+        index,
+        rows,
+        columns,
+        newRevisionId: out.newRevisionId,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_modify_table',
+    {
+      title: 'Modify table structure (rows / columns)',
+      description:
+        'Inserts or deletes a row or column in an existing table. Requires the tableStartIndex (found via doc_inspect_tables) and cell row/column coordinates.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tableStartIndex: indexSchema.describe('Start index of the table (see doc_inspect_tables).'),
+        action: z
+          .enum(['INSERT_ROW_ABOVE', 'INSERT_ROW_BELOW', 'DELETE_ROW', 'INSERT_COLUMN_LEFT', 'INSERT_COLUMN_RIGHT', 'DELETE_COLUMN'])
+          .describe('Modification action.'),
+        rowIndex: z.number().int().nonnegative().describe('Target row index (0-indexed).'),
+        columnIndex: z.number().int().nonnegative().describe('Target column index (0-indexed).'),
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, tableStartIndex, action, rowIndex, columnIndex, tabId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      const tab = getTab(m, tabId);
+      const tId = tab.tabId;
+
+      let req: DocsRequest;
+      switch (action) {
+        case 'INSERT_ROW_ABOVE':
+          req = buildInsertTableRowRequest(tableStartIndex, rowIndex, columnIndex, false, tId);
+          break;
+        case 'INSERT_ROW_BELOW':
+          req = buildInsertTableRowRequest(tableStartIndex, rowIndex, columnIndex, true, tId);
+          break;
+        case 'DELETE_ROW':
+          req = buildDeleteTableRowRequest(tableStartIndex, rowIndex, columnIndex, tId);
+          break;
+        case 'INSERT_COLUMN_LEFT':
+          req = buildInsertTableColumnRequest(tableStartIndex, rowIndex, columnIndex, false, tId);
+          break;
+        case 'INSERT_COLUMN_RIGHT':
+          req = buildInsertTableColumnRequest(tableStartIndex, rowIndex, columnIndex, true, tId);
+          break;
+        case 'DELETE_COLUMN':
+          req = buildDeleteTableColumnRequest(tableStartIndex, rowIndex, columnIndex, tId);
+          break;
+      }
+
+      const out = await runBatch(ctx, id, [req], writeControlFor(ctx, m, 'EDIT'));
+      return ok({
+        status: 'ok',
+        action,
+        tableStartIndex,
+        rowIndex,
+        columnIndex,
+        newRevisionId: out.newRevisionId,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_insert_image',
+    {
+      title: 'Insert inline image',
+      description:
+        'Inserts an inline image from a publicly accessible URI (HTTPS, <50MB, PNG/JPEG/GIF) at index. Optionally specify widthPt and heightPt (in points).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        index: indexSchema.describe('Document model index to insert image at.'),
+        imageUri: z.string().url().describe('Publicly accessible HTTPS image URL.'),
+        widthPt: z.number().positive().optional().describe('Display width in points.'),
+        heightPt: z.number().positive().optional().describe('Display height in points.'),
+        tabId: tabIdSchema,
+        revisionId: revisionIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, index, imageUri, widthPt, heightPt, tabId, revisionId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      checkRevision(m, revisionId);
+      const tab = getTab(m, tabId);
+      if (index < 1 || index > tab.endIndex) return fail(`Invalid index ${index} for tab ending at ${tab.endIndex}.`);
+      if (tab.text[index] === GAP) return fail(`Cannot insert image at index ${index}: it is a structural marker.`);
+      const req = buildInsertImageRequest(
+        { index, ...(tab.tabId ? { tabId: tab.tabId } : {}) },
+        imageUri,
+        widthPt,
+        heightPt,
+      );
+      const out = await runBatch(ctx, id, [req], writeControlFor(ctx, m, 'EDIT'));
+      return ok({
+        status: 'ok',
+        index,
+        imageUri,
+        newRevisionId: out.newRevisionId,
+      });
+    }),
+  );
+
+  // ---- Category E: Native comments & suggestions management --------------
 
   server.registerTool(
     'doc_add_comment',

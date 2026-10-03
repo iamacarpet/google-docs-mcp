@@ -2,20 +2,12 @@
  * Edit planning: validates index ranges against the cached document and builds
  * Docs API batchUpdate requests that are safe to submit together.
  *
+ * Supports plain replacements, rich text styling, paragraph styles, bullets,
+ * tables, and images.
+ *
  * Ordering rule (CRITICAL): edits are always emitted in DESCENDING startIndex
  * order (bottom-to-top) so earlier requests never shift the indices of later
  * ones.
- *
- * Replacement strategy: each replacement is emitted as
- *     insertText @ endIndex   followed by   deleteContentRange [startIndex, endIndex)
- * Inserting at the END of the range first means
- *   - in SUGGEST mode the result reads "old (struck through) → new (green)", and
- *     the deletion range is still valid because nothing before it moved;
- *   - in EDIT mode the result is identical to delete-then-insert, but the new
- *     text inherits the styling of the replaced text (the Docs API styles
- *     inserted text like the character immediately before the insertion point).
- * If endIndex sits on a structural marker (e.g. the start of a table) where
- * text cannot be inserted, we fall back to delete-then-insert @ startIndex.
  */
 
 import { GAP, type IndexRange, type TabModel, truncate } from './docModel.js';
@@ -25,8 +17,20 @@ export type DocsRequest = Record<string, any>;
 
 export class EditValidationError extends Error {}
 
+export interface TextStyleInput {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  fontSize?: number;
+  foregroundColor?: string | { red: number; green: number; blue: number };
+  backgroundColor?: string | { red: number; green: number; blue: number };
+  linkUrl?: string;
+}
+
 export interface RangeEdit extends IndexRange {
   text: string;
+  textStyle?: TextStyleInput;
 }
 
 export interface PlannedEdit extends RangeEdit {
@@ -34,6 +38,68 @@ export interface PlannedEdit extends RangeEdit {
   notes: string[];
   /** Original text being replaced (raw buffer slice). */
   originalText: string;
+}
+
+export interface ParagraphBorderInput {
+  padding?: number;
+  width?: number;
+  dashStyle?: 'SOLID' | 'DOT' | 'DASH' | string;
+  color?: string | { red: number; green: number; blue: number };
+}
+
+export interface ParagraphStyleInput {
+  namedStyleType?: string;
+  alignment?: 'START' | 'CENTER' | 'END' | 'JUSTIFIED';
+  spaceAbove?: number;
+  spaceBelow?: number;
+  lineSpacing?: number;
+  spacingMode?: 'SPACING_MODE_UNSPECIFIED' | 'NEVER_COLLAPSE' | 'COLLAPSE_LISTS';
+  indentStart?: number;
+  indentEnd?: number;
+  indentFirstLine?: number;
+  padding?: number;
+  shadingColor?: string | { red: number; green: number; blue: number };
+  keepLinesTogether?: boolean;
+  keepWithNext?: boolean;
+  avoidWidowAndOrphan?: boolean;
+  pageBreakBefore?: boolean;
+  borderTop?: ParagraphBorderInput;
+  borderBottom?: ParagraphBorderInput;
+  borderLeft?: ParagraphBorderInput;
+  borderRight?: ParagraphBorderInput;
+  borderBetween?: ParagraphBorderInput;
+}
+
+export function hasStyle(s?: TextStyleInput): boolean {
+  if (!s) return false;
+  return (
+    s.bold !== undefined ||
+    s.italic !== undefined ||
+    s.underline !== undefined ||
+    s.strikethrough !== undefined ||
+    s.fontSize !== undefined ||
+    s.foregroundColor !== undefined ||
+    s.backgroundColor !== undefined ||
+    s.linkUrl !== undefined
+  );
+}
+
+export function parseColor(c: string | { red: number; green: number; blue: number }): { red: number; green: number; blue: number } {
+  if (typeof c === 'object' && c !== null) return c;
+  let hex = String(c).replace('#', '').trim();
+  if (hex.length === 3) {
+    hex = hex
+      .split('')
+      .map((ch) => ch + ch)
+      .join('');
+  }
+  const num = parseInt(hex, 16);
+  if (isNaN(num)) return { red: 0, green: 0, blue: 0 };
+  return {
+    red: Math.max(0, Math.min(1, ((num >> 16) & 255) / 255)),
+    green: Math.max(0, Math.min(1, ((num >> 8) & 255) / 255)),
+    blue: Math.max(0, Math.min(1, (num & 255) / 255)),
+  };
 }
 
 function isLowSurrogate(code: number): boolean {
@@ -45,7 +111,7 @@ function isLowSurrogate(code: number): boolean {
  * Throws EditValidationError with an actionable message on failure.
  */
 export function planRangeEdit(tab: TabModel, edit: RangeEdit, expectedText?: string): PlannedEdit {
-  let { startIndex, endIndex, text } = edit;
+  let { startIndex, endIndex, text, textStyle } = edit;
   const notes: string[] = [];
   if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex)) {
     throw new EditValidationError('startIndex and endIndex must be integers.');
@@ -78,8 +144,10 @@ export function planRangeEdit(tab: TabModel, edit: RangeEdit, expectedText?: str
     notes.push('Trailing newline preserved: both the original range and the new text ended with a newline.');
   }
 
-  if (endIndex === startIndex && text.length === 0) {
-    throw new EditValidationError('Edit is a no-op (empty range and empty text).');
+  const hasFormatting = hasStyle(textStyle);
+
+  if (endIndex === startIndex && text.length === 0 && !hasFormatting) {
+    throw new EditValidationError('Edit is a no-op (empty range, empty text, and no style).');
   }
   if (startIndex < tab.endIndex && isLowSurrogate(tab.text.charCodeAt(startIndex))) {
     throw new EditValidationError(`startIndex ${startIndex} splits a surrogate pair (emoji / astral character).`);
@@ -97,7 +165,7 @@ export function planRangeEdit(tab: TabModel, edit: RangeEdit, expectedText?: str
     throw new EditValidationError(`Cannot insert text at index ${startIndex}: it is a structural marker (e.g. table start).`);
   }
 
-  return { startIndex, endIndex, text, notes, originalText: tab.text.slice(startIndex, endIndex) };
+  return { startIndex, endIndex, text, textStyle, notes, originalText: tab.text.slice(startIndex, endIndex) };
 }
 
 /** Sorts edits bottom-up and rejects overlaps. Returns a new array. */
@@ -115,27 +183,367 @@ export function sortEditsDescending<T extends IndexRange>(edits: T[]): T[] {
   return sorted;
 }
 
-function withTab<T extends Record<string, any>>(obj: T, tabId: string): T {
+export function withTab<T extends Record<string, any>>(obj: T, tabId?: string): T {
   return tabId ? { ...obj, tabId } : obj;
 }
 
-/** Builds the requests for one replacement (see module docs for the strategy). */
+export function buildUpdateTextStyleRequest(
+  range: { startIndex: number; endIndex: number; tabId?: string },
+  style: TextStyleInput,
+): DocsRequest {
+  const textStyle: Record<string, any> = {};
+  const fields: string[] = [];
+
+  if (style.bold !== undefined) {
+    textStyle.bold = style.bold;
+    fields.push('bold');
+  }
+  if (style.italic !== undefined) {
+    textStyle.italic = style.italic;
+    fields.push('italic');
+  }
+  if (style.underline !== undefined) {
+    textStyle.underline = style.underline;
+    fields.push('underline');
+  }
+  if (style.strikethrough !== undefined) {
+    textStyle.strikethrough = style.strikethrough;
+    fields.push('strikethrough');
+  }
+  if (style.fontSize !== undefined) {
+    textStyle.fontSize = { magnitude: style.fontSize, unit: 'PT' };
+    fields.push('fontSize');
+  }
+  if (style.foregroundColor !== undefined) {
+    const rgb = parseColor(style.foregroundColor);
+    textStyle.foregroundColor = { color: { rgbColor: rgb } };
+    fields.push('foregroundColor');
+  }
+  if (style.backgroundColor !== undefined) {
+    const rgb = parseColor(style.backgroundColor);
+    textStyle.backgroundColor = { color: { rgbColor: rgb } };
+    fields.push('backgroundColor');
+  }
+  if (style.linkUrl !== undefined) {
+    textStyle.link = style.linkUrl ? { url: style.linkUrl } : {};
+    fields.push('link');
+  }
+
+  return {
+    updateTextStyle: {
+      range: {
+        startIndex: range.startIndex,
+        endIndex: range.endIndex,
+        ...(range.tabId ? { tabId: range.tabId } : {}),
+      },
+      textStyle,
+      fields: fields.join(','),
+    },
+  };
+}
+
+function buildParagraphBorder(b: ParagraphBorderInput, defaultPadding?: number): Record<string, any> {
+  const pad = b.padding !== undefined ? b.padding : defaultPadding !== undefined ? defaultPadding : 0;
+  const w = b.width !== undefined ? b.width : 1;
+  const c = b.color ? parseColor(b.color) : { red: 0, green: 0, blue: 0 };
+  return {
+    padding: { magnitude: pad, unit: 'PT' },
+    width: { magnitude: w, unit: 'PT' },
+    dashStyle: b.dashStyle ?? 'SOLID',
+    color: { color: { rgbColor: c } },
+  };
+}
+
+export function buildUpdateParagraphStyleRequest(
+  range: { startIndex: number; endIndex: number; tabId?: string },
+  style: ParagraphStyleInput,
+): DocsRequest {
+  const paragraphStyle: Record<string, any> = {};
+  const fields: string[] = [];
+
+  if (style.namedStyleType) {
+    paragraphStyle.namedStyleType = style.namedStyleType;
+    fields.push('namedStyleType');
+  }
+  if (style.alignment) {
+    paragraphStyle.alignment = style.alignment;
+    fields.push('alignment');
+  }
+  if (style.spaceAbove !== undefined) {
+    paragraphStyle.spaceAbove = { magnitude: style.spaceAbove, unit: 'PT' };
+    fields.push('spaceAbove');
+  }
+  if (style.spaceBelow !== undefined) {
+    paragraphStyle.spaceBelow = { magnitude: style.spaceBelow, unit: 'PT' };
+    fields.push('spaceBelow');
+  }
+  if (style.lineSpacing !== undefined) {
+    paragraphStyle.lineSpacing = style.lineSpacing;
+    fields.push('lineSpacing');
+  }
+  if (style.spacingMode) {
+    paragraphStyle.spacingMode = style.spacingMode;
+    fields.push('spacingMode');
+  }
+  if (style.indentStart !== undefined) {
+    paragraphStyle.indentStart = { magnitude: style.indentStart, unit: 'PT' };
+    fields.push('indentStart');
+  }
+  if (style.indentEnd !== undefined) {
+    paragraphStyle.indentEnd = { magnitude: style.indentEnd, unit: 'PT' };
+    fields.push('indentEnd');
+  }
+  if (style.indentFirstLine !== undefined) {
+    paragraphStyle.indentFirstLine = { magnitude: style.indentFirstLine, unit: 'PT' };
+    fields.push('indentFirstLine');
+  }
+  if (style.shadingColor !== undefined) {
+    paragraphStyle.shading = {
+      backgroundColor: { color: { rgbColor: parseColor(style.shadingColor) } },
+    };
+    fields.push('shading.backgroundColor');
+  }
+  if (style.keepLinesTogether !== undefined) {
+    paragraphStyle.keepLinesTogether = style.keepLinesTogether;
+    fields.push('keepLinesTogether');
+  }
+  if (style.keepWithNext !== undefined) {
+    paragraphStyle.keepWithNext = style.keepWithNext;
+    fields.push('keepWithNext');
+  }
+  if (style.avoidWidowAndOrphan !== undefined) {
+    paragraphStyle.avoidWidowAndOrphan = style.avoidWidowAndOrphan;
+    fields.push('avoidWidowAndOrphan');
+  }
+  if (style.pageBreakBefore !== undefined) {
+    paragraphStyle.pageBreakBefore = style.pageBreakBefore;
+    fields.push('pageBreakBefore');
+  }
+
+  if (style.padding !== undefined && !style.borderTop && !style.borderBottom && !style.borderLeft && !style.borderRight) {
+    const zeroBorder = (pad: number) => ({
+      padding: { magnitude: pad, unit: 'PT' },
+      width: { magnitude: 0, unit: 'PT' },
+      dashStyle: 'SOLID',
+      color: { color: { rgbColor: { red: 0, green: 0, blue: 0 } } },
+    });
+    paragraphStyle.borderTop = zeroBorder(style.padding);
+    paragraphStyle.borderBottom = zeroBorder(style.padding);
+    paragraphStyle.borderLeft = zeroBorder(style.padding);
+    paragraphStyle.borderRight = zeroBorder(style.padding);
+    fields.push('borderTop', 'borderBottom', 'borderLeft', 'borderRight');
+  } else {
+    if (style.borderTop) {
+      paragraphStyle.borderTop = buildParagraphBorder(style.borderTop, style.padding);
+      fields.push('borderTop');
+    }
+    if (style.borderBottom) {
+      paragraphStyle.borderBottom = buildParagraphBorder(style.borderBottom, style.padding);
+      fields.push('borderBottom');
+    }
+    if (style.borderLeft) {
+      paragraphStyle.borderLeft = buildParagraphBorder(style.borderLeft, style.padding);
+      fields.push('borderLeft');
+    }
+    if (style.borderRight) {
+      paragraphStyle.borderRight = buildParagraphBorder(style.borderRight, style.padding);
+      fields.push('borderRight');
+    }
+    if (style.borderBetween) {
+      paragraphStyle.borderBetween = buildParagraphBorder(style.borderBetween, style.padding);
+      fields.push('borderBetween');
+    }
+  }
+
+  return {
+    updateParagraphStyle: {
+      range: {
+        startIndex: range.startIndex,
+        endIndex: range.endIndex,
+        ...(range.tabId ? { tabId: range.tabId } : {}),
+      },
+      paragraphStyle,
+      fields: fields.join(','),
+    },
+  };
+}
+
+export function buildBulletsRequest(
+  range: { startIndex: number; endIndex: number; tabId?: string },
+  preset?: string,
+  remove?: boolean,
+): DocsRequest {
+  const r = {
+    startIndex: range.startIndex,
+    endIndex: range.endIndex,
+    ...(range.tabId ? { tabId: range.tabId } : {}),
+  };
+  if (remove) {
+    return { deleteParagraphBullets: { range: r } };
+  }
+  return {
+    createParagraphBullets: {
+      range: r,
+      bulletPreset: preset || 'BULLET_DISC_CIRCLE_SQUARE',
+    },
+  };
+}
+
+export function buildInsertTableRequest(
+  location: { index: number; tabId?: string },
+  rows: number,
+  columns: number,
+): DocsRequest {
+  return {
+    insertTable: {
+      rows,
+      columns,
+      location: {
+        index: location.index,
+        ...(location.tabId ? { tabId: location.tabId } : {}),
+      },
+    },
+  };
+}
+
+export function buildInsertTableRowRequest(
+  tableStart: number,
+  rowIndex: number,
+  columnIndex: number,
+  insertBelow: boolean,
+  tabId?: string,
+): DocsRequest {
+  return {
+    insertTableRow: {
+      insertBelow,
+      tableCellLocation: {
+        tableStartLocation: { index: tableStart, ...(tabId ? { tabId } : {}) },
+        rowIndex,
+        columnIndex,
+      },
+    },
+  };
+}
+
+export function buildDeleteTableRowRequest(
+  tableStart: number,
+  rowIndex: number,
+  columnIndex: number,
+  tabId?: string,
+): DocsRequest {
+  return {
+    deleteTableRow: {
+      tableCellLocation: {
+        tableStartLocation: { index: tableStart, ...(tabId ? { tabId } : {}) },
+        rowIndex,
+        columnIndex,
+      },
+    },
+  };
+}
+
+export function buildInsertTableColumnRequest(
+  tableStart: number,
+  rowIndex: number,
+  columnIndex: number,
+  insertRight: boolean,
+  tabId?: string,
+): DocsRequest {
+  return {
+    insertTableColumn: {
+      insertRight,
+      tableCellLocation: {
+        tableStartLocation: { index: tableStart, ...(tabId ? { tabId } : {}) },
+        rowIndex,
+        columnIndex,
+      },
+    },
+  };
+}
+
+export function buildDeleteTableColumnRequest(
+  tableStart: number,
+  rowIndex: number,
+  columnIndex: number,
+  tabId?: string,
+): DocsRequest {
+  return {
+    deleteTableColumn: {
+      tableCellLocation: {
+        tableStartLocation: { index: tableStart, ...(tabId ? { tabId } : {}) },
+        rowIndex,
+        columnIndex,
+      },
+    },
+  };
+}
+
+export function buildInsertImageRequest(
+  location: { index: number; tabId?: string },
+  uri: string,
+  widthPt?: number,
+  heightPt?: number,
+): DocsRequest {
+  const objectSize: Record<string, any> = {};
+  if (widthPt) objectSize.width = { magnitude: widthPt, unit: 'PT' };
+  if (heightPt) objectSize.height = { magnitude: heightPt, unit: 'PT' };
+
+  return {
+    insertInlineImage: {
+      uri,
+      location: {
+        index: location.index,
+        ...(location.tabId ? { tabId: location.tabId } : {}),
+      },
+      ...(Object.keys(objectSize).length ? { objectSize } : {}),
+    },
+  };
+}
+
+/** Builds the requests for one replacement with optional formatting. */
 export function buildReplaceRequests(tab: TabModel, edit: RangeEdit): DocsRequest[] {
-  const { startIndex, endIndex, text } = edit;
+  const { startIndex, endIndex, text, textStyle } = edit;
   const reqs: DocsRequest[] = [];
+  const shouldStyle = hasStyle(textStyle);
+
   const del: DocsRequest | null =
     endIndex > startIndex
       ? { deleteContentRange: { range: withTab({ startIndex, endIndex }, tab.tabId) } }
       : null;
-  if (!text) return del ? [del] : [];
 
+  // Case 1: Pure styling on existing text range (no new text inserted)
+  if (!text) {
+    if (shouldStyle && endIndex > startIndex) {
+      reqs.push(buildUpdateTextStyleRequest(withTab({ startIndex, endIndex }, tab.tabId), textStyle!));
+      return reqs;
+    }
+    return del ? [del] : [];
+  }
+
+  // Case 2: Text replacement / insertion with optional styling
   const canInsertAtEnd = endIndex < tab.endIndex && tab.text[endIndex] !== GAP;
   if (canInsertAtEnd || !del) {
     reqs.push({ insertText: { location: withTab({ index: endIndex }, tab.tabId), text } });
+    if (shouldStyle) {
+      reqs.push(
+        buildUpdateTextStyleRequest(
+          withTab({ startIndex: endIndex, endIndex: endIndex + text.length }, tab.tabId),
+          textStyle!,
+        ),
+      );
+    }
     if (del) reqs.push(del);
   } else {
-    reqs.push(del);
+    if (del) reqs.push(del);
     reqs.push({ insertText: { location: withTab({ index: startIndex }, tab.tabId), text } });
+    if (shouldStyle) {
+      reqs.push(
+        buildUpdateTextStyleRequest(
+          withTab({ startIndex, endIndex: startIndex + text.length }, tab.tabId),
+          textStyle!,
+        ),
+      );
+    }
   }
   return reqs;
 }

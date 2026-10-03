@@ -30,16 +30,21 @@ Options:
   -v, --version    Show version number and exit
 
 Environment Variables:
-  GOOGLE_OAUTH_CREDENTIALS     Path to OAuth 2.0 client secret JSON (desktop app)
-  DOCS_MCP_TOKEN_PATH          Path to stored OAuth token JSON
+  GOOGLE_CLIENT_ID             Google OAuth 2.0 Client ID (recommended)
+  GOOGLE_CLIENT_SECRET         Google OAuth 2.0 Client Secret (recommended)
+  GOOGLE_OAUTH_CREDENTIALS     Alternative: path to OAuth client JSON file
+  DOCS_MCP_TOKEN_PATH          Path to stored OAuth token JSON (default: ~/.config/docs-mcp/token.json)
   DOCS_MCP_CACHE_TTL_MS        In-memory cache validation TTL in ms (default: 30000)
   DOCS_MCP_CACHE_MAX_ENTRIES   Max number of documents in cache (default: 20)
   DOCS_MCP_REQUIRE_REVISION    Enforce revision checks on mutation (default: true)
   DOCS_MCP_SCOPES              Space-separated OAuth scopes to request
+  DOCS_MCP_NO_INTERACTIVE      Set to 'true' to disable automatic browser popups
 
-Authentication Setup:
-  Run \`npm run auth\` once to generate token.json from your OAuth credentials.
-  Alternatively, configure Google Cloud Application Default Credentials (ADC).
+Authentication:
+  - If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are provided, the server
+    automatically initiates a one-time browser login flow if token.json is missing.
+  - Or pre-authenticate in terminal: \`npm run auth\`.
+  - Or configure Google Cloud Application Default Credentials (ADC).
 \n`);
 }
 

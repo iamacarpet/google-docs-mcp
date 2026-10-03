@@ -84,20 +84,31 @@ To connect `docs-mcp` to your Google account, you will set up a free Google Clou
 4. Name it `Docs MCP Desktop Client` and click **Create**.
 5. Click **Download JSON** on the confirmation dialog.
 
-### Step 5: Save Credentials & Authorize
-1. Save the downloaded file to:
-   ```bash
-   mkdir -p ~/.config/docs-mcp
-   mv /path/to/downloaded-client-secret.json ~/.config/docs-mcp/credentials.json
-   ```
-   *(Or set `export GOOGLE_OAUTH_CREDENTIALS=/path/to/credentials.json`)*.
-2. Run the one-time interactive authorization tool:
-   ```bash
-   npm run auth
-   ```
-3. A browser window will open automatically asking you to log into Google and grant consent.
-4. Once granted, your tokens will be saved to `~/.config/docs-mcp/token.json` with secure file permissions (`0600`).
-5. **You are done!** The server will automatically refresh expired access tokens in the background; you do not need to authenticate again.
+### Step 5: Configure Credentials & Automatic Authorization
+
+You can supply credentials in either of two ways:
+
+#### Option A: Environment Variables in your MCP Client Config (Recommended)
+Copy your `client_id` and `client_secret` directly into your MCP client's configuration (see [Section 4](#4-client-configuration)). The server will automatically use them!
+
+#### Option B: Credentials File
+Alternatively, save the downloaded credentials JSON to:
+```bash
+mkdir -p ~/.config/docs-mcp
+mv /path/to/downloaded-client-secret.json ~/.config/docs-mcp/credentials.json
+```
+*(Or set `export GOOGLE_OAUTH_CREDENTIALS=/path/to/credentials.json`)*.
+
+### Semi-Interactive Browser Authorization
+`docs-mcp` uses the standard **semi-interactive loopback flow**:
+1. When your AI assistant (Antigravity, Claude, etc.) starts the server for the first time, the server detects that no cached token exists.
+2. It automatically spins up a local loopback listener on `127.0.0.1` and opens your default browser to the Google OAuth consent screen.
+3. You select your Google account and click **Allow**.
+4. The browser displays **"Authorization Successful!"** and the server saves your refresh token to `~/.config/docs-mcp/token.json` (mode 0600).
+5. The MCP server completes initialization and immediately starts serving tools.
+6. **Future runs are completely silent**: The server reads `token.json` and automatically refreshes access tokens in the background when they expire.
+
+*(You can also pre-authorize anytime from your terminal by running `npm run auth`).*
 
 ---
 
@@ -105,7 +116,7 @@ To connect `docs-mcp` to your Google account, you will set up a free Google Clou
 
 ### Connecting to Google Antigravity
 
-In Antigravity, add the server to your user or workspace configuration (e.g. `~/.gemini/antigravity/mcpSettings.json` or your project `.gemini/settings.json`):
+In Antigravity, add `docs-mcp` to your MCP configuration (e.g. `~/.gemini/antigravity/mcpSettings.json` or your workspace `.gemini/settings.json`):
 
 ```json
 {
@@ -114,6 +125,8 @@ In Antigravity, add the server to your user or workspace configuration (e.g. `~/
       "command": "node",
       "args": ["/ABSOLUTE/PATH/TO/docs-mcp/dist/index.js"],
       "env": {
+        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "GOCSPX-your-client-secret",
         "DOCS_MCP_CACHE_TTL_MS": "30000",
         "DOCS_MCP_REQUIRE_REVISION": "true"
       }
@@ -131,7 +144,11 @@ Add `docs-mcp` to your `claude_desktop_config.json` (`~/Library/Application Supp
   "mcpServers": {
     "google-docs": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/docs-mcp/dist/index.js"]
+      "args": ["/ABSOLUTE/PATH/TO/docs-mcp/dist/index.js"],
+      "env": {
+        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "GOCSPX-your-client-secret"
+      }
     }
   }
 }
@@ -139,7 +156,7 @@ Add `docs-mcp` to your `claude_desktop_config.json` (`~/Library/Application Supp
 
 ### Connecting to Cursor or other MCP Clients
 
-Specify `node` as the executable and the absolute path to `dist/index.js` as the argument, using the standard `stdio` transport.
+Specify `node` as the executable, `/path/to/docs-mcp/dist/index.js` as the argument, and supply `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `env`.
 
 ---
 

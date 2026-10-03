@@ -1,0 +1,32 @@
+{
+  "name": "docs-mcp",
+  "version": "0.1.0",
+  "description": "Context-efficient Google Docs MCP server with native comment, anchor and suggestion-mode support.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "docs-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "auth": "node dist/authCli.js",
+    "test": "tsc -p tsconfig.json && node --test 'dist/test/**/*.test.js'",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@googleapis/docs": "^14.1.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}

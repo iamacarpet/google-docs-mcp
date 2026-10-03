@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+*.tsbuildinfo
+
+# Local tooling & binaries
+.tools/
+
+# Logs & temp files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+
+# Secrets & OAuth tokens (CRITICAL - never commit)
+credentials.json
+*credentials*.json
+token.json
+*token*.json
+.env
+.env.*

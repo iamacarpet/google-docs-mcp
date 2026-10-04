@@ -25,9 +25,11 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Optional textStyle on edit tools formats ONLY the newly inserted text. NEVER apply textStyle.strikethrough to simulate deletion.
    - Pattern B: Style-Guide Formal Amendments (Retain Original Wording as Bold Strikethrough):
      * When a formal style guide requires RETAINING original wording as bold strikethrough rather than removing it, and adding new text as bold:
+       CRITICAL SEQUENCING: ALWAYS insert the new text FIRST, and format the original text SECOND!
+       If you format first, Google Docs will automatically expand the bold strikethrough suggestion to swallow the inserted text at the boundary, striking through both!
        1) Do NOT use doc_suggest_deletion.
-       2) Format the original text with bold strikethrough: use doc_format_text with bold: true and strikethrough: true (in SUGGEST mode or EDIT mode).
-       3) Insert the new text as bold: use doc_suggest_edit_range with startIndex === endIndex, suggestedText: " new text", and textStyle: { bold: true }.
+       2) Insert the new text FIRST: use doc_suggest_edit_range with startIndex === endIndex (at the boundary of original text), suggestedText: " new text", and textStyle: { bold: true, strikethrough: false }.
+       3) Format the original text SECOND: use doc_format_text with startIndex and endIndex matching the original text, expectedText, bold: true, strikethrough: true, and writeMode: "SUGGEST".
    - For comment-driven edits: use doc_suggest_comment_revision (replaces comment's anchored text in suggestion mode and resolves thread).
    - For several edits at once: use doc_batch_suggest_edits (applied bottom-up automatically).
    - Use doc_apply_direct_edit ONLY if the user explicitly says e.g. "overwrite directly", "do not use suggestions" or "make definitive edits".

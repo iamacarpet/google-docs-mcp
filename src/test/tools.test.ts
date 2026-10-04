@@ -399,8 +399,22 @@ describe('MCP Tools', () => {
     assert.ok(res.notes[0].includes('Applied bold strikethrough styling as a suggestion'));
   });
 
-  it('style-guide amendment pattern: supports retaining original wording as bold strikethrough and inserting new text as bold', async () => {
-    // Step 1: Format original text as bold strikethrough
+  it('style-guide amendment pattern: supports inserting new text first as bold and retaining original wording as bold strikethrough second', async () => {
+    // Step 1: Insert replacement text as bold at boundary FIRST (with strikethrough: false)
+    const resInsert = await callTool('doc_suggest_edit_range', {
+      documentId: 'doc_test_123',
+      startIndex: 89,
+      endIndex: 89,
+      suggestedText: ' advance expeditiously',
+      textStyle: { bold: true, strikethrough: false },
+    });
+    assert.equal(resInsert.status, 'ok');
+    assert.equal(backend.batchCalls[0].writeControl?.writeMode, 'SUGGEST');
+    assert.equal(backend.batchCalls[0].requests[0].insertText.text, ' advance expeditiously');
+    assert.equal(backend.batchCalls[0].requests[1].updateTextStyle.textStyle.bold, true);
+    assert.equal(backend.batchCalls[0].requests[1].updateTextStyle.textStyle.strikethrough, false);
+
+    // Step 2: Format original text as bold strikethrough SECOND
     const resFormat = await callTool('doc_format_text', {
       documentId: 'doc_test_123',
       startIndex: 69,
@@ -410,21 +424,8 @@ describe('MCP Tools', () => {
       writeMode: 'SUGGEST',
     });
     assert.equal(resFormat.status, 'ok');
-    assert.equal(backend.batchCalls[0].writeControl?.writeMode, 'SUGGEST');
-    assert.equal(backend.batchCalls[0].requests[0].updateTextStyle.textStyle.bold, true);
-    assert.equal(backend.batchCalls[0].requests[0].updateTextStyle.textStyle.strikethrough, true);
-
-    // Step 2: Insert replacement text as bold at boundary
-    const resInsert = await callTool('doc_suggest_edit_range', {
-      documentId: 'doc_test_123',
-      startIndex: 89,
-      endIndex: 89,
-      suggestedText: ' advance expeditiously',
-      textStyle: { bold: true },
-    });
-    assert.equal(resInsert.status, 'ok');
     assert.equal(backend.batchCalls[1].writeControl?.writeMode, 'SUGGEST');
-    assert.equal(backend.batchCalls[1].requests[0].insertText.text, ' advance expeditiously');
-    assert.equal(backend.batchCalls[1].requests[1].updateTextStyle.textStyle.bold, true);
+    assert.equal(backend.batchCalls[1].requests[0].updateTextStyle.textStyle.bold, true);
+    assert.equal(backend.batchCalls[1].requests[0].updateTextStyle.textStyle.strikethrough, true);
   });
 });

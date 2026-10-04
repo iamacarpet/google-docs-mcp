@@ -861,7 +861,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         '- To suggest INSERTING new text: pass startIndex === endIndex (pure insertion), along with suggestedText and optional textStyle (e.g. bold: true).\n' +
         '- To suggest DELETING text: pass suggestedText: "" (or use the dedicated doc_suggest_deletion tool).\n' +
         '- NOTE ON textStyle: textStyle formats ONLY the newly inserted text. It does NOT format the deleted text. Do NOT pass textStyle: { strikethrough: true } to simulate deletion; Google Docs tracks deletions natively.\n' +
-        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires RETAINING original wording as bold strikethrough rather than deleting it, use doc_format_text(bold: true, strikethrough: true) on the original text, and use doc_suggest_edit_range with startIndex === endIndex to insert the new wording as bold.',
+        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires RETAINING original wording as bold strikethrough rather than deleting it, ALWAYS insert the new wording FIRST using doc_suggest_edit_range with startIndex === endIndex and textStyle: { bold: true, strikethrough: false }, and THEN format the original text SECOND using doc_format_text(bold: true, strikethrough: true). Never format first, or Google Docs will expand the strikethrough suggestion to swallow the inserted text.',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
@@ -911,7 +911,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         '- Pure insertion: set startIndex === endIndex with suggestedText and optional textStyle (e.g. bold: true).\n' +
         '- Deletion: set suggestedText: "" to suggest deleting the target range.\n' +
         '- Replacement: provide target range and suggestedText.\n' +
-        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires retaining original wording as bold strikethrough, use doc_format_text on original text and insert new text as bold with startIndex === endIndex.',
+        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires retaining original wording as bold strikethrough, insert the new text FIRST as bold with startIndex === endIndex and strikethrough: false, then format the original text SECOND with bold strikethrough.',
       inputSchema: {
         documentId: documentIdSchema,
         edits: z

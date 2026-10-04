@@ -7,19 +7,34 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
    - Start with doc_list_comments to survey open review threads, or doc_get_outline / doc_get_metadata to orient yourself.
    - Do NOT read the whole document unless explicitly asked. Use doc_read_comment_context(commentId) for a comment's anchored text plus surrounding paragraphs, and doc_read_range for an outline section (startIndex..sectionEndIndex).
    - Low-token reading: doc_read_range returns plain text and compact Markdown annotatedText by default (with **bold**, *italic*, <u>underline</u>, ~~strikethrough~~, links, and image placeholders). This conveys full formatting without context bloat.
+   - Suggestions vs. Document Formatting:
+     * In annotatedText, ~~strikethrough~~ (and **~~bold strikethrough~~**) represents INTENTIONAL document-level text formatting (such as retained wording under formal style guides, or form options). It is NOT a Google Docs suggestion!
+     * Google Docs pending suggestions are tracked changes, rendered as [-deleted text-] and {+inserted text+} (markSuggestions is enabled by default).
+     * Range queries report hasPendingSuggestions and pendingSuggestions metadata with exact suggestion IDs, kinds, and bounds.
    - Selective granular flags in doc_read_range:
-     * includeRuns: false (default). Set true ONLY when you need exact integer index bounds for each individual styled word or span.
+     * includeRuns: false (default). Set true ONLY when you need exact integer index bounds for each individual styled word or span. Styled runs include suggestion metadata (suggestion.kind: 'deletion' | 'insertion') to distinguish native suggestions from formatting.
      * includeParagraphs: false (default). Set true ONLY when inspecting paragraph layout, spacing, padding, margins, or borders.
      * In doc_inspect_tables: set includeCellText: false if you only need table dimensions, column counts, and index coordinates.
 
-2. EDITORIAL SUGGESTION POLICY
+2. EDITORIAL SUGGESTION POLICY & TWO EDITING PATTERNS
    - By default ALL revisions must be submitted as SUGGESTIONS (tracked changes), never direct overwrites.
-   - For comment-driven edits use doc_suggest_comment_revision: it replaces exactly the comment's anchored text in suggestion mode and resolves the thread in one batchUpdate.
-   - For several edits at once use doc_batch_suggest_edits (applied bottom-up automatically).
+   - Pattern A: Native Docs Tracked Changes (Full Deletion / Standard Revisions):
+     * To delete/remove text: use doc_suggest_deletion (or doc_suggest_edit_range with suggestedText: ""). Google Docs marks the text as a suggested deletion (which Docs displays visually with strikethrough in its web UI). When accepted, the text is removed.
+     * To replace text: use doc_suggest_edit_range with [startIndex, endIndex) and suggestedText.
+     * To insert text: use doc_suggest_edit_range with startIndex === endIndex and suggestedText.
+     * Optional textStyle on edit tools formats ONLY the newly inserted text. NEVER apply textStyle.strikethrough to simulate deletion.
+   - Pattern B: Style-Guide Formal Amendments (Retain Original Wording as Bold Strikethrough):
+     * When a formal style guide requires RETAINING original wording as bold strikethrough rather than removing it, and adding new text as bold:
+       1) Do NOT use doc_suggest_deletion.
+       2) Format the original text with bold strikethrough: use doc_format_text with bold: true and strikethrough: true (in SUGGEST mode or EDIT mode).
+       3) Insert the new text as bold: use doc_suggest_edit_range with startIndex === endIndex, suggestedText: " new text", and textStyle: { bold: true }.
+   - For comment-driven edits: use doc_suggest_comment_revision (replaces comment's anchored text in suggestion mode and resolves thread).
+   - For several edits at once: use doc_batch_suggest_edits (applied bottom-up automatically).
    - Use doc_apply_direct_edit ONLY if the user explicitly says e.g. "overwrite directly", "do not use suggestions" or "make definitive edits".
 
 3. RICH TEXT FORMATTING & INLINE STYLES
    - Format existing spans: Use doc_format_text to apply styling properties (bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl) to any range in SUGGEST or EDIT mode.
+   - Warning on strikethrough: doc_format_text with strikethrough: true applies a font style and keeps the text in the document. Never use it to delete text (use doc_suggest_deletion instead).
    - Style while editing: Edit tools (doc_suggest_edit_range, doc_apply_direct_edit, doc_suggest_comment_revision, doc_batch_suggest_edits) accept an optional textStyle object ({ bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl }) to style inserted or replaced text immediately in the same call.
 
 4. PARAGRAPH STYLES, SPACING & PADDING

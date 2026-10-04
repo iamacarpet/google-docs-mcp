@@ -109,6 +109,10 @@ export interface TextStyleInfo {
 export interface StyledRun extends IndexRange {
   text: string;
   style: TextStyleInfo;
+  suggestion?: {
+    kind: 'insertion' | 'deletion';
+    suggestionIds: string[];
+  };
 }
 
 export interface TableCellModel extends IndexRange {
@@ -423,7 +427,12 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw, i
               maxSize = Math.max(maxSize, size);
             }
             trackSuggestions(pe.textRun, s, e);
-            for (const id of Object.keys(pe.textRun.suggestedTextStyleChanges ?? {})) addSpan(id, 'textStyle', s, e);
+            for (const [id, change] of Object.entries(pe.textRun.suggestedTextStyleChanges ?? {})) {
+              addSpan(id, 'textStyle', s, e);
+              const st = (change as any)?.textStyleSuggestionState;
+              if (st?.strikethroughSuggested) addSpan(id, 'format:strikethrough', s, e);
+              if (st?.boldSuggested) addSpan(id, 'format:bold', s, e);
+            }
 
             const style: TextStyleInfo = {
               bold: ts.bold ?? ns?.textStyle?.bold ?? false,
@@ -436,8 +445,22 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw, i
               linkUrl: ts.link?.url ?? undefined,
             };
 
+            const ins: string[] = pe.textRun.suggestedInsertionIds ?? [];
+            const del: string[] = pe.textRun.suggestedDeletionIds ?? [];
+            const sug = del.length
+              ? { kind: 'deletion' as const, suggestionIds: [...del] }
+              : ins.length
+                ? { kind: 'insertion' as const, suggestionIds: [...ins] }
+                : undefined;
+
+            const sameSuggestion = (a?: StyledRun['suggestion'], b?: StyledRun['suggestion']) => {
+              if (!a && !b) return true;
+              if (!a || !b) return false;
+              return a.kind === b.kind && sameIds(a.suggestionIds, b.suggestionIds);
+            };
+
             const lastRun = styledRuns[styledRuns.length - 1];
-            if (lastRun && lastRun.endIndex === s && sameStyle(lastRun.style, style)) {
+            if (lastRun && lastRun.endIndex === s && sameStyle(lastRun.style, style) && sameSuggestion(lastRun.suggestion, sug)) {
               lastRun.endIndex = e;
               lastRun.text += c;
             } else {
@@ -446,6 +469,7 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw, i
                 endIndex: e,
                 text: c,
                 style,
+                suggestion: sug,
               });
             }
           } else if (pe.inlineObjectElement) {
@@ -807,8 +831,37 @@ export function getRunsInRange(tab: TabModel, start: number, end: number): Style
         endIndex: e,
         text: sanitize(tab.text.slice(s, e)),
         style: r.style,
+        suggestion: r.suggestion,
       };
     });
+}
+
+export interface SuggestionInRange {
+  suggestionId: string;
+  kind: string;
+  startIndex: number;
+  endIndex: number;
+  text: string;
+}
+
+export function getSuggestionsInRange(tab: TabModel, start: number, end: number): SuggestionInRange[] {
+  const list: SuggestionInRange[] = [];
+  for (const [id, span] of tab.suggestionSpans) {
+    for (const r of span.ranges) {
+      if (r.endIndex > start && r.startIndex < end) {
+        const s = Math.max(r.startIndex, start);
+        const e = Math.min(r.endIndex, end);
+        list.push({
+          suggestionId: id,
+          kind: [...span.kinds].join('/'),
+          startIndex: s,
+          endIndex: e,
+          text: sanitize(tab.text.slice(s, e)),
+        });
+      }
+    }
+  }
+  return list.sort((a, b) => a.startIndex - b.startIndex);
 }
 
 export function getTablesInRange(tab: TabModel, start: number, end: number): TableModel[] {

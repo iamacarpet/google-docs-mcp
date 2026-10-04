@@ -15,6 +15,7 @@ import {
   getRunsInRange,
   getTableContext,
   getTablesInRange,
+  getSuggestionsInRange,
   getTab,
   paragraphIndexAt,
   renderAnnotatedText,
@@ -446,14 +447,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         caseSensitive: z.boolean().optional().describe('Default false.'),
         maxResults: z.number().int().min(1).max(100).optional().describe('Default 5.'),
         previewRadius: z.number().int().min(10).max(300).optional().describe('Surrounding chars on each side (default 40).'),
+        markSuggestions: z.boolean().optional().describe('Show pending suggestions in snippets as [-deleted-]/{+inserted+} (default true).'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, query, tabId, caseSensitive, maxResults, previewRadius }) => {
+    safe(async ({ documentId, query, tabId, caseSensitive, maxResults, previewRadius, markSuggestions }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
       const max = maxResults ?? 5;
       const radius = previewRadius ?? 40;
+      const mark = markSuggestions !== false;
       const res = searchText(tab, query, { caseSensitive, maxResults: max });
       return ok({
         revisionId: m.revisionId,
@@ -461,7 +464,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         query,
         totalMatches: res.totalMatches,
         matches: res.matches.map((r) => {
-          const prev = preview(tab, r.startIndex, r.endIndex, radius, 'match');
+          const prev = preview(tab, r.startIndex, r.endIndex, radius, 'match', mark);
           return {
             startIndex: r.startIndex,
             endIndex: r.endIndex,
@@ -618,7 +621,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Read text range',
       description:
-        'Reads text strictly between global startIndex (inclusive) and endIndex (exclusive). By default (includeFormatting=true), returns both raw plain text and rich Markdown annotatedText (bold, italic, underline, strikethrough, images), plus structured styled runs, and table context if inside a table. Large ranges are truncated at 20,000 chars.',
+        'Reads text strictly between global startIndex (inclusive) and endIndex (exclusive). By default (includeFormatting=true), returns both raw plain text and rich Markdown annotatedText (bold, italic, underline, strikethrough, images), plus structured styled runs, and table context if inside a table. Large ranges are truncated at 20,000 chars.\n\n' +
+        'CRITICAL ON STRIKETHROUGH VS SUGGESTIONS:\n' +
+        '- In annotatedText, ~~strikethrough~~ (and **~~bold strikethrough~~**) represents INTENTIONAL document-level text formatting (such as retained wording under formal style guides, or form options). It is NOT a Google Docs suggestion!\n' +
+        '- Google Docs pending suggestions are tracked changes, shown as [-deleted text-] and {+inserted text+} when markSuggestions is enabled (default true).\n' +
+        '- When pending suggestions exist within the range, they are reported with their exact suggestionId, kind, and bounds in pendingSuggestions.',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
@@ -626,11 +633,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         tabId: tabIdSchema,
         includeFormatting: z.boolean().optional().describe('Master toggle for rich formatting. If false, returns raw plain text only (default true).'),
         includeAnnotatedText: z.boolean().optional().describe('Include Markdown annotatedText with **bold**, *italic*, <u>underline</u>, ~~strike~~, and links. Very low token cost (default true when formatting is enabled).'),
-        includeRuns: z.boolean().optional().describe('Include verbose styled runs array with exact coordinates and style objects. Set true only when you need exact index bounds for individual style spans (default false to save tokens).'),
+        includeRuns: z.boolean().optional().describe('Include verbose styled runs array with exact coordinates, style objects, and suggestion metadata (default false to save tokens).'),
         includeParagraphs: z.boolean().optional().describe('Include verbose paragraph layout/styling objects (spacing, margins, borders, padding). Set true only when inspecting or adjusting paragraph layout (default false to save tokens).'),
         includeTables: z.boolean().optional().describe('Include table structure and coordinates if range intersects tables (default true).'),
         includeImages: z.boolean().optional().describe('Include inline image metadata if present (default true).'),
-        markSuggestions: z.boolean().optional().describe('Show pending suggestions as [-deleted-]/{+inserted+} (default false).'),
+        markSuggestions: z.boolean().optional().describe('Show pending suggestions as [-deleted-]/{+inserted+} (default true). When false, returns raw buffer without diff markers.'),
       },
       annotations: RO,
     },
@@ -653,7 +660,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       if (startIndex >= tab.endIndex) return fail(`startIndex ${startIndex} is beyond the end of the tab (${tab.endIndex}).`);
       const end = Math.min(endIndex, tab.endIndex, startIndex + MAX_READ_CHARS);
       const truncated = end < Math.min(endIndex, tab.endIndex);
-      const plainText = renderText(tab, startIndex, end, !!markSuggestions);
+      const mark = markSuggestions !== false;
+      const plainText = renderText(tab, startIndex, end, mark);
+      const pendingSuggestions = getSuggestionsInRange(tab, startIndex, end);
 
       const formatting = includeFormatting !== false;
       const res: Record<string, any> = {
@@ -662,11 +671,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         startIndex,
         endIndex: end,
         text: plainText,
+        hasPendingSuggestions: pendingSuggestions.length > 0,
       };
+      if (pendingSuggestions.length > 0) {
+        res.pendingSuggestions = pendingSuggestions;
+      }
 
       if (formatting) {
         if (includeAnnotatedText !== false) {
-          res.annotatedText = renderAnnotatedText(tab, startIndex, end, !!markSuggestions);
+          res.annotatedText = renderAnnotatedText(tab, startIndex, end, mark);
         }
         if (includeRuns === true) {
           const runs = getRunsInRange(tab, startIndex, end);
@@ -811,19 +824,53 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     );
 
   const suggestRange = rangeEditHandler('SUGGEST');
+
+  server.registerTool(
+    'doc_suggest_deletion',
+    {
+      title: 'Suggest deletion of text range',
+      description:
+        'Submits a suggested revision (tracked change) to DELETE the text in [startIndex, endIndex). ' +
+        'In Google Docs, this creates a native tracked deletion suggestion (which Docs displays visually with strikethrough in its web UI). ' +
+        'When accepted, the text is removed from the document.\n\n' +
+        'CRITICAL DISTINCTION:\n' +
+        '- Use doc_suggest_deletion when you want to DELETE/REMOVE text as a tracked change.\n' +
+        '- If your style guide requires RETAINING original wording formatted as bold strikethrough (and not removing it), do NOT use this tool; use doc_format_text with bold: true and strikethrough: true instead.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        startIndex: indexSchema,
+        endIndex: indexSchema,
+        expectedText: expectedTextSchema,
+        revisionId: revisionIdSchema,
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => suggestRange({ ...args, text: '' }),
+  );
+
   server.registerTool(
     'doc_suggest_edit_range',
     {
       title: 'Suggest edit for a range',
       description:
-        'Submits a suggested revision (tracked change) replacing [startIndex, endIndex) with suggestedText. Optionally format the suggested text using textStyle (bold, italic, underline, strikethrough, etc.).',
+        'Submits a suggested revision (tracked change) replacing [startIndex, endIndex) with suggestedText. ' +
+        'Optionally format the NEW suggested text using textStyle (bold, italic, underline, etc.).\n\n' +
+        'USAGE PATTERNS:\n' +
+        '- To suggest REPLACING text: provide [startIndex, endIndex) and suggestedText.\n' +
+        '- To suggest INSERTING new text: pass startIndex === endIndex (pure insertion), along with suggestedText and optional textStyle (e.g. bold: true).\n' +
+        '- To suggest DELETING text: pass suggestedText: "" (or use the dedicated doc_suggest_deletion tool).\n' +
+        '- NOTE ON textStyle: textStyle formats ONLY the newly inserted text. It does NOT format the deleted text. Do NOT pass textStyle: { strikethrough: true } to simulate deletion; Google Docs tracks deletions natively.\n' +
+        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires RETAINING original wording as bold strikethrough rather than deleting it, use doc_format_text(bold: true, strikethrough: true) on the original text, and use doc_suggest_edit_range with startIndex === endIndex to insert the new wording as bold.',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
         endIndex: indexSchema,
-        suggestedText: z.string(),
+        suggestedText: z
+          .string()
+          .describe('The new replacement text. Pass empty string "" to suggest deleting the range. For pure insertion, set startIndex equal to endIndex.'),
         expectedText: expectedTextSchema,
-        textStyle: textStyleSchema,
+        textStyle: textStyleSchema.describe('Styling applied to the NEW replacement text (e.g. bold: true). Does not affect deleted text.'),
         revisionId: revisionIdSchema,
         tabId: tabIdSchema,
       },
@@ -859,7 +906,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Batch suggest edits',
       description:
-        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId or an explicit [startIndex, endIndex) range, with optional textStyle. The server sorts edits bottom-to-top so indices never drift.',
+        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId or an explicit [startIndex, endIndex) range, with optional textStyle. The server sorts edits bottom-to-top so indices never drift.\n\n' +
+        'USAGE PATTERNS:\n' +
+        '- Pure insertion: set startIndex === endIndex with suggestedText and optional textStyle (e.g. bold: true).\n' +
+        '- Deletion: set suggestedText: "" to suggest deleting the target range.\n' +
+        '- Replacement: provide target range and suggestedText.\n' +
+        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires retaining original wording as bold strikethrough, use doc_format_text on original text and insert new text as bold with startIndex === endIndex.',
       inputSchema: {
         documentId: documentIdSchema,
         edits: z
@@ -869,8 +921,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
               startIndex: indexSchema.optional(),
               endIndex: indexSchema.optional(),
               expectedText: expectedTextSchema,
-              suggestedText: z.string(),
-              textStyle: textStyleSchema,
+              suggestedText: z
+                .string()
+                .describe('Replacement text. Pass empty string "" to suggest deleting the target text. For pure insertion, set startIndex equal to endIndex.'),
+              textStyle: textStyleSchema.describe('Styling applied to the NEW replacement text (e.g. bold: true). Does not affect deleted text.'),
             }),
           )
           .min(1)
@@ -952,7 +1006,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Format text style',
       description:
-        'Applies text formatting (bold, italic, underline, strikethrough, fontSize, colors, link) to a range [startIndex, endIndex). Can run in SUGGEST mode (tracked formatting suggestion) or EDIT mode (direct formatting).',
+        'Applies inline text formatting (bold, italic, underline, strikethrough, fontSize, colors, link) to a range [startIndex, endIndex). Can run in SUGGEST mode (tracked formatting suggestion) or EDIT mode (direct formatting).\n\n' +
+        'CRITICAL GUIDANCE ON STRIKETHROUGH VS DELETIONS:\n' +
+        '- Applying strikethrough formats the text with a strikethrough font; it RETAINS the text in the document.\n' +
+        '- Use this tool for STYLE-GUIDE FORMAL AMENDMENTS where the requirement is to retain original wording in the document as bold strikethrough (bold: true, strikethrough: true).\n' +
+        '- Do NOT use this tool if you want to DELETE or REMOVE text as a native tracked change! For native tracked deletion, use doc_suggest_deletion or doc_suggest_edit_range with suggestedText: "".',
       inputSchema: {
         documentId: documentIdSchema,
         startIndex: indexSchema,
@@ -961,7 +1019,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         bold: z.boolean().optional().describe('Bold styling.'),
         italic: z.boolean().optional().describe('Italic styling.'),
         underline: z.boolean().optional().describe('Underline styling.'),
-        strikethrough: z.boolean().optional().describe('Strikethrough styling.'),
+        strikethrough: z
+          .boolean()
+          .optional()
+          .describe(
+            'Strikethrough styling. Formats text with strikethrough font while keeping text in the document. Do NOT use to suggest deleting text (use doc_suggest_deletion instead).',
+          ),
         fontSize: z.number().positive().optional().describe('Font size in points.'),
         foregroundColor: z.string().optional().describe('Hex color string (e.g. "#FF0000").'),
         backgroundColor: z.string().optional().describe('Hex background color string.'),
@@ -1029,6 +1092,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         }
 
         const mode = writeMode ?? 'SUGGEST';
+        const notes: string[] = [];
+        if (explicitStyle.strikethrough) {
+          if (mode === 'SUGGEST' && !explicitStyle.bold) {
+            notes.push(
+              'Applied strikethrough styling as a suggestion. NOTE: This formats the text with a strikethrough font and retains it in the document. If your goal was to propose DELETING/REMOVING this text from the document, use doc_suggest_deletion or doc_suggest_edit_range with suggestedText: "" instead.',
+            );
+          } else if (mode === 'SUGGEST' && explicitStyle.bold) {
+            notes.push(
+              'Applied bold strikethrough styling as a suggestion (standard for style-guide formal amendments that retain original wording).',
+            );
+          }
+        }
+
         const req = buildUpdateTextStyleRequest(
           { startIndex, endIndex, ...(tab.tabId ? { tabId: tab.tabId } : {}) },
           explicitStyle,
@@ -1043,6 +1119,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           appliedStyle: explicitStyle,
           createdSuggestionIds: mode === 'SUGGEST' ? suggestionIdsFrom(out.response, 'createdSuggestionIds') : undefined,
           newRevisionId: out.newRevisionId,
+          notes: notes.length ? notes : undefined,
         });
       },
     ),

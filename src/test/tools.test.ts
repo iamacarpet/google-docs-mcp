@@ -327,4 +327,104 @@ describe('MCP Tools', () => {
     assert.equal(resReject.status, 'ok');
     assert.equal(backend.batchCalls[1].requests[0].rejectSuggestion.suggestionId, 'sug_ins_1');
   });
+
+  it('doc_suggest_deletion: creates native tracked deletion suggestion', async () => {
+    const res = await callTool('doc_suggest_deletion', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      expectedText: 'we must move rapidly',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.mode, 'SUGGEST');
+    assert.equal(res.newText, '');
+    assert.equal(backend.batchCalls.length, 1);
+    const call = backend.batchCalls[0];
+    assert.equal(call.writeControl?.writeMode, 'SUGGEST');
+    assert.deepEqual(call.requests[0], {
+      deleteContentRange: {
+        range: { startIndex: 69, endIndex: 89 },
+      },
+    });
+  });
+
+  it('doc_read_range: defaults markSuggestions to true and reports pendingSuggestions metadata', async () => {
+    const res = await callTool('doc_read_range', {
+      documentId: 'doc_test_123',
+      startIndex: 136,
+      endIndex: 193,
+    });
+
+    assert.equal(res.startIndex, 136);
+    assert.equal(res.endIndex, 193);
+    assert.equal(res.hasPendingSuggestions, true);
+    assert.ok(Array.isArray(res.pendingSuggestions));
+    assert.equal(res.pendingSuggestions.length, 1);
+    assert.equal(res.pendingSuggestions[0].suggestionId, 'sug_ins_1');
+    assert.equal(res.pendingSuggestions[0].kind, 'insertion');
+    assert.equal(res.pendingSuggestions[0].startIndex, 148);
+    assert.equal(res.pendingSuggestions[0].endIndex, 155);
+    // Diff markers should be present by default
+    assert.ok(res.text.includes('{+public +}'));
+    assert.ok(res.annotatedText.includes('{+public +}'));
+  });
+
+  it('doc_format_text: returns guidance note when strikethrough alone is applied in SUGGEST mode', async () => {
+    const res = await callTool('doc_format_text', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      strikethrough: true,
+      writeMode: 'SUGGEST',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.ok(res.notes && res.notes.length > 0);
+    assert.ok(res.notes[0].includes('formats the text with a strikethrough font and retains it'));
+  });
+
+  it('doc_format_text: acknowledges bold strikethrough for formal amendments in SUGGEST mode', async () => {
+    const res = await callTool('doc_format_text', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      bold: true,
+      strikethrough: true,
+      writeMode: 'SUGGEST',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.ok(res.notes && res.notes.length > 0);
+    assert.ok(res.notes[0].includes('Applied bold strikethrough styling as a suggestion'));
+  });
+
+  it('style-guide amendment pattern: supports retaining original wording as bold strikethrough and inserting new text as bold', async () => {
+    // Step 1: Format original text as bold strikethrough
+    const resFormat = await callTool('doc_format_text', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      bold: true,
+      strikethrough: true,
+      writeMode: 'SUGGEST',
+    });
+    assert.equal(resFormat.status, 'ok');
+    assert.equal(backend.batchCalls[0].writeControl?.writeMode, 'SUGGEST');
+    assert.equal(backend.batchCalls[0].requests[0].updateTextStyle.textStyle.bold, true);
+    assert.equal(backend.batchCalls[0].requests[0].updateTextStyle.textStyle.strikethrough, true);
+
+    // Step 2: Insert replacement text as bold at boundary
+    const resInsert = await callTool('doc_suggest_edit_range', {
+      documentId: 'doc_test_123',
+      startIndex: 89,
+      endIndex: 89,
+      suggestedText: ' advance expeditiously',
+      textStyle: { bold: true },
+    });
+    assert.equal(resInsert.status, 'ok');
+    assert.equal(backend.batchCalls[1].writeControl?.writeMode, 'SUGGEST');
+    assert.equal(backend.batchCalls[1].requests[0].insertText.text, ' advance expeditiously');
+    assert.equal(backend.batchCalls[1].requests[1].updateTextStyle.textStyle.bold, true);
+  });
 });

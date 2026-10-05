@@ -138,6 +138,11 @@ export class DocCache {
     this.entries.delete(documentId);
   }
 
+  clear(): void {
+    this.entries.clear();
+    this.inflight.clear();
+  }
+
   peek(documentId: string): DocModel | undefined {
     return this.entries.get(documentId)?.model;
   }

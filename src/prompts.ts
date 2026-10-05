@@ -4,7 +4,10 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Docs editorial MCP server with first-class support for native comments, comment anchors, suggestion mode, redline amendments, rich text formatting, tables, images, and paragraph layout.
 
 1. DOCUMENT READING & NAVIGATION
-   - Quick orientation: Start with doc_list_comments to survey review threads, or doc_get_outline / doc_get_metadata to orient yourself.
+   - Quick orientation:
+     * doc_get_changes_summary provides an immediate high-level digest of all pending suggestions and open comments grouped by section.
+     * doc_list_comments surveys review threads (supports author, query, startIndex/endIndex range filters, and groupBySection: true).
+     * doc_get_outline / doc_get_metadata to orient yourself with document structure and statistics.
    - Low-token reading: doc_read_range returns plain text and compact Markdown annotatedText by default (with **bold**, *italic*, <u>underline</u>, ~~strikethrough~~, links, and image placeholders). Omit startIndex and endIndex to read the full active tab.
    - Full document reading:
      * Use doc_read_document to read the entire document in token-optimized Markdown with outline hierarchy, section markers, pending suggestions summary, and tables overview.
@@ -21,6 +24,8 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
 
 2. EDITORIAL SUGGESTION POLICY & THREE EDITING PATTERNS
    - By default ALL revisions must be submitted as SUGGESTIONS (tracked changes), never direct overwrites.
+   - Explanatory Comments / Rationale:
+     * doc_suggest_edit_range, doc_suggest_redline_edit, and items in doc_batch_suggest_edits accept an optional commentText parameter to anchor a rationale/review comment to the edited range in the same atomic call!
    - Pattern A: Native Docs Tracked Changes (Full Deletion / Standard Revisions):
      * To delete/remove text: use doc_suggest_deletion (or doc_suggest_edit_range with suggestedText: ""). Google Docs marks the text as a suggested deletion. When accepted, the text is removed.
      * To replace text: use doc_suggest_edit_range with [startIndex, endIndex) and suggestedText.
@@ -31,11 +36,13 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Use doc_suggest_redline_edit! It automatically executes the Docs API sequence to avoid the boundary-swallowing bug (placing and styling inserted text first, and formatting retained original text second).
      * Fully configurable: specify retainedStyle (default: { bold: true, strikethrough: true }) and replacementStyle (default: { bold: true, strikethrough: false }), or customize colors/italics for any role or process stage.
      * In batch edits: set redline: true on any item in doc_batch_suggest_edits.
-   - Pattern C: Global Search & Replace:
-     * Use doc_suggest_replace_all to propose search-and-replace revisions across the entire tab in suggestion mode in ONE atomic call. Supports both native tracked replacements and redline mode (original retained as bold strikethrough).
+   - Pattern C: Search & Replace:
+     * Use doc_suggest_replace_all to propose search-and-replace revisions across the entire tab (or bound to a specific range via startIndex/endIndex) in suggestion mode in ONE atomic call. Supports both native tracked replacements and redline mode.
 
 3. BATCH OPERATIONS & WORKFLOW AUTOMATION
-   - Batch Suggest Edits: Use doc_batch_suggest_edits to submit up to 50 edits across comments or ranges in one atomic batchUpdate. Automatically sorted bottom-up to prevent index drift. Supports standard edits, pure insertions, deletions, and redline amendments.
+   - Batch Suggest Edits: Use doc_batch_suggest_edits to submit up to 50 edits across comments or ranges in one atomic batchUpdate. Automatically sorted bottom-up to prevent index drift. Supports standard edits, pure insertions, deletions, redline amendments, and commentText rationales.
+   - Batch Manage Comments: Use doc_batch_manage_comments to bulk resolve, reopen, delete, or reply to comment threads (including action: "RESOLVE_ALL" / "REOPEN_ALL" or explicit commentIds / heterogeneous operations).
+   - Batch Add Comments: Use doc_batch_add_comments to anchor multiple comments across the document in one atomic call with expectedText safety guards.
    - Batch Manage Suggestions: Use doc_batch_manage_suggestions to accept or reject multiple suggestions at once (specify suggestionIds or pass action: "ACCEPT_ALL" / "REJECT_ALL").
    - Raw Docs API Escape Hatch: Use doc_raw_batch_update to send ANY raw Google Docs REST API requests (parity with official Google Workspace MCP update_doc), with writeMode: "SUGGEST" or "EDIT".
    - Document Creation: Use doc_create_document to create a new document in Google Drive with an optional initial text body.
@@ -57,7 +64,12 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Lists: bulletPreset ('BULLET_DISC_CIRCLE_SQUARE', 'BULLET_CHECKBOX', 'NUMBERED_DECIMAL_ALPHA_ROMAN', etc.) or removeBullets.
 
 6. TABLES & IMAGES
-   - Tables: Inspect tables via doc_inspect_tables. Insert tables via doc_insert_table (supports optional cells: string[][] 2D text matrix to populate cells immediately). Add or remove rows/columns via doc_modify_table.
+   - Tables:
+     * Read tables: Use doc_read_table to retrieve any table formatted as a Markdown table, a 2D text matrix, and cell index coordinates.
+     * Inspect tables: Survey table dimensions and coordinates via doc_inspect_tables.
+     * Insert tables: Use doc_insert_table (supports optional cells: string[][] 2D text matrix to populate cells immediately).
+     * Insert rows: Use doc_insert_table_row to add a row ABOVE or BELOW an existing row and optionally populate its cells with text in one atomic call.
+     * Modify structure: Add or remove rows/columns via doc_modify_table.
    - Images: Insert inline images via doc_insert_image from public HTTPS URLs with optional widthPt and heightPt.
 
 7. CHARACTER COORDINATES & INDEX INTEGRITY

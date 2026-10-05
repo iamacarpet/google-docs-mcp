@@ -211,9 +211,10 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 
 | Tool | Purpose | Description |
 |---|---|---|
+| `doc_get_changes_summary` | Editorial digest | Generates a high-level changelog and editorial digest of pending suggestions and open comments, broken down by author and outline section heading. |
 | `doc_get_metadata` | Document status | Returns title, revisionId, character count, tab listing, table count, image count, comments summary, and suggestion count. |
 | `doc_get_outline` | Document structure | Returns hierarchical outline of formal headings (`HEADING_1`..`HEADING_6`, `TITLE`) and pseudo-headings (bold/enlarged single-line section dividers < 80 chars) with exact global coordinates and `sectionEndIndex`. |
-| `doc_list_comments` | Survey feedback | Surveys comment threads with author, status (`OPEN` / `RESOLVED`), feedback text, current anchor text, and coordinates. |
+| `doc_list_comments` | Survey feedback | Surveys comment threads with author, status (`OPEN` / `RESOLVED`), feedback text, current anchor text, and coordinates. Supports filters by `author`, keyword `query`, range bounds (`startIndex`/`endIndex`), and section grouping (`groupBySection: true`). |
 | `doc_search_text` | Find text | Finds occurrences of terms/phrases across the document buffer without dumping content into context; returns exact `startIndex`/`endIndex` and snippet preview. |
 | `doc_list_suggestions` | Tracked changes | Lists pending suggestions (insertions, deletions, text styles) with `suggestionId`, type, author, summary, and preview. |
 
@@ -222,6 +223,7 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 | Tool | Purpose | Description |
 |---|---|---|
 | `doc_read_document` | Full document read | Reads entire document in token-efficient Markdown with outline hierarchy, section markers, pending suggestions summary, and tables overview. Also supports `format: "raw_json"` for 1:1 parity with Google Workspace MCP `read_doc`. |
+| `doc_read_table` | Dedicated table read | Extracts an individual table formatted as clean GitHub-Flavored Markdown table, a 2D text matrix, or both, with exact cell coordinate bounds. |
 | `doc_read_comment_context` | Read around comment | Fetches the targeted sentence and surrounding paragraph(s) for a given `commentId`, wrapping the anchor in `<target>...</target>` tags, with anchor style runs and table context. |
 | `doc_read_range` | Read bounds with Rich Text | Reads text between `startIndex` and `endIndex` (or entire tab if bounds omitted). Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and tables/images in range. |
 | `doc_inspect_tables` | Inspect tables | Lists all tables in the document (or a specific table) with dimensions, start/end index, and cell matrix (row, column, text, startIndex, endIndex). Supports `includeCellText: false` for low-token structural inspections. |
@@ -232,10 +234,12 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 |---|---|---|
 | `doc_suggest_comment_revision` | **Review Automation** | Atomically replaces the anchored text of a comment with suggested wording in suggestion mode (`writeMode: "SUGGEST"`), supports `textStyle`, and resolves the comment thread in a single `batchUpdate`. |
 | `doc_suggest_deletion` | Tracked deletion | Submits a native tracked deletion suggestion. Text is removed when accepted (Google Docs renders this with strikethrough in its web UI). |
-| `doc_suggest_edit_range` | Propose revision | Submits a suggested revision between `startIndex` and `endIndex` (or pure insertion if `startIndex === endIndex`). Supports optional `textStyle` on inserted text. |
-| `doc_suggest_redline_edit` | **Styled Redline Amendment** | Solves the Docs API boundary-swallowing bug for formal style guides: retains original text with custom formatting (e.g. bold strikethrough) and inserts replacement text alongside it (e.g. bold), without deleting original wording. |
-| `doc_suggest_replace_all` | Search & replace all | Finds all occurrences of text and proposes tracked replacements across the document in ONE atomic call. Supports both standard replacements and redline mode. |
-| `doc_batch_suggest_edits` | Batch revisions | Submits multiple suggested revisions in one atomic `batchUpdate`. Supports `textStyle`, deletions, pure insertions, and `redline: true` per item. Automatically orders edits bottom-to-top and rejects overlaps. |
+| `doc_suggest_edit_range` | Propose revision | Submits a suggested revision between `startIndex` and `endIndex` (or pure insertion if `startIndex === endIndex`). Supports optional `textStyle` on inserted text, and optional `commentText` to anchor an explanatory rationale comment. |
+| `doc_suggest_redline_edit` | **Styled Redline Amendment** | Solves the Docs API boundary-swallowing bug for formal style guides: retains original text with custom formatting (e.g. bold strikethrough) and inserts replacement text alongside it (e.g. bold), without deleting original wording. Supports optional `commentText` rationale. |
+| `doc_suggest_replace_all` | Search & replace | Finds occurrences of text and proposes tracked replacements across the document (or within `startIndex`/`endIndex` bounds) in ONE atomic call. Supports both standard replacements and redline mode. |
+| `doc_batch_suggest_edits` | Batch revisions | Submits multiple suggested revisions in one atomic `batchUpdate`. Supports `textStyle`, `commentText` rationales, deletions, pure insertions, and `redline: true` per item. Automatically orders edits bottom-to-top and rejects overlaps. |
+| `doc_batch_manage_comments` | **Bulk Comment Actions** | Bulk resolves, reopens, deletes, or replies to comment threads in a single call. Supports `RESOLVE_ALL`, `REOPEN_ALL`, explicit `commentIds`, or heterogeneous per-comment `operations`. |
+| `doc_batch_add_comments` | **Batch Anchored Comments** | Creates multiple anchored review comments across the document in a single atomic call with `expectedText` safety guards and optional `assigneeEmail`. |
 | `doc_batch_manage_suggestions` | Bulk accept/reject | Atomically accepts or rejects multiple suggestions at once by ID or with `action: "ACCEPT_ALL"` / `"REJECT_ALL"`. |
 | `doc_apply_direct_edit` | Direct overwrite | Overwrites `[startIndex, endIndex)` directly (`writeMode: "EDIT"`). Supports optional `textStyle`. |
 | `doc_raw_batch_update` | **Docs API Escape Hatch** | Direct passthrough to Docs API `batchUpdate` (1:1 parity with Google Workspace MCP `update_doc`). Executes arbitrary native Docs requests with `writeMode: "SUGGEST"` or `"EDIT"`. |
@@ -252,6 +256,7 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 | `doc_format_text` | Style text | Formats any text range with bold, italic, underline, strikethrough, fontSize, colors, links. Runs in `SUGGEST` or `EDIT` mode. |
 | `doc_format_paragraph` | Headings, Spacing & Lists | Updates paragraph style (`NORMAL_TEXT`, `TITLE`, `HEADING_1`..`HEADING_6`), text alignment, spacing (`spaceAbove`, `spaceBelow`, `lineSpacing`), indentation (`indentStart`, `indentEnd`, `indentFirstLine`), border padding, background shading (`shadingColor`), or creates/removes bullet and numbered lists. |
 | `doc_insert_table` | Insert table | Inserts a table with rows and columns at an index; supports optional `cells: string[][]` initial 2D text matrix to populate cells immediately. |
+| `doc_insert_table_row` | Insert table row | Inserts a new table row ABOVE or BELOW an existing row and optionally populates cell contents with strings in one atomic call. |
 | `doc_modify_table` | Modify table rows/cols | Adds or removes rows or columns in an existing table (`INSERT_ROW_ABOVE`, `INSERT_ROW_BELOW`, `DELETE_ROW`, `INSERT_COLUMN_LEFT`, `INSERT_COLUMN_RIGHT`, `DELETE_COLUMN`). |
 | `doc_insert_image` | Insert image | Inserts an inline image from a publicly accessible HTTPS URI with optional width and height dimensions in points. |
 

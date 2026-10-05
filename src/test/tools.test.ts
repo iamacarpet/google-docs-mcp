@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { docs_v1 } from '@googleapis/docs';
 import { registerTools, type ToolContext } from '../tools.js';
 import { DocCache, type DocsBackend, type FullFetch } from '../docsClient.js';
-import { createSampleDocument } from './fixtures.js';
+import { createSampleDocument, createFormattedDocument } from './fixtures.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -56,7 +56,15 @@ class MockDocsBackend implements DocsBackend {
       writeControl: {
         requiredRevisionId: newRev,
       },
-      replies: requests.map((_r) => ({})),
+      replies: requests.map((r, idx) => {
+        if (r.insertComment) {
+          return { insertComment: { commentThread: { commentId: `mock_comment_${idx}` } } };
+        }
+        if (r.addCommentReply) {
+          return { addCommentReply: { post: { postId: `mock_post_${idx}` } } };
+        }
+        return {};
+      }),
       suggestionResponses: [
         {
           createdSuggestionIds: ['sug_new_1'],
@@ -610,5 +618,181 @@ describe('MCP Tools', () => {
     assert.equal(res.status, 'ok');
     assert.equal(res.rows, 2);
     assert.equal(res.columns, 2);
+  });
+
+  it('doc_get_changes_summary: generates editorial digest of suggestions and open comments', async () => {
+    const res = await callTool('doc_get_changes_summary', {
+      documentId: 'doc_test_123',
+    });
+
+    assert.ok(res.totalPendingSuggestions !== undefined);
+    assert.ok(res.totalOpenComments !== undefined);
+    assert.ok(Array.isArray(res.sectionsWithChanges));
+  });
+
+  it('doc_list_comments: filters by author, query, and groups by section', async () => {
+    // Test author filter
+    const resAuthor = await callTool('doc_list_comments', {
+      documentId: 'doc_test_123',
+      author: 'Alice',
+      status: 'ALL',
+    });
+    assert.ok(resAuthor.comments.every((c: any) => c.author.includes('Alice')));
+
+    // Test query filter
+    const resQuery = await callTool('doc_list_comments', {
+      documentId: 'doc_test_123',
+      query: 'rephrase',
+      status: 'ALL',
+    });
+    assert.ok(resQuery.comments.length > 0);
+
+    // Test section grouping
+    const resGrouped = await callTool('doc_list_comments', {
+      documentId: 'doc_test_123',
+      groupBySection: true,
+      status: 'ALL',
+    });
+    assert.ok(Array.isArray(resGrouped.sections));
+    assert.ok(resGrouped.sections.length > 0);
+  });
+
+  it('doc_suggest_edit_range & doc_suggest_redline_edit: anchor rationale comments', async () => {
+    // Range edit with comment
+    const resEdit = await callTool('doc_suggest_edit_range', {
+      documentId: 'doc_test_123',
+      startIndex: 10,
+      endIndex: 20,
+      suggestedText: 'replacement',
+      commentText: 'Rationale for replacing this wording.',
+    });
+    assert.equal(resEdit.status, 'ok');
+    assert.equal(resEdit.commentCreated, true);
+    const lastBatchEdit = backend.batchCalls[backend.batchCalls.length - 1];
+    assert.ok(lastBatchEdit.requests.some((r: any) => r.insertComment));
+
+    // Redline edit with comment
+    const resRedline = await callTool('doc_suggest_redline_edit', {
+      documentId: 'doc_test_123',
+      startIndex: 30,
+      endIndex: 40,
+      replacementText: 'amended text',
+      commentText: 'Formal amendment rationale.',
+    });
+    assert.equal(resRedline.status, 'ok');
+    assert.equal(resRedline.commentCreated, true);
+    const lastBatchRedline = backend.batchCalls[backend.batchCalls.length - 1];
+    assert.ok(lastBatchRedline.requests.some((r: any) => r.insertComment));
+  });
+
+  it('doc_batch_suggest_edits: supports commentText rationale on batch items', async () => {
+    const res = await callTool('doc_batch_suggest_edits', {
+      documentId: 'doc_test_123',
+      edits: [
+        {
+          startIndex: 50,
+          endIndex: 60,
+          suggestedText: 'revision 1',
+          commentText: 'Rationale 1',
+        },
+        {
+          startIndex: 70,
+          endIndex: 80,
+          suggestedText: 'revision 2',
+          commentText: 'Rationale 2',
+        },
+      ],
+    });
+
+    assert.equal(res.status, 'ok');
+    const lastBatch = backend.batchCalls[backend.batchCalls.length - 1];
+    const insertComments = lastBatch.requests.filter((r: any) => r.insertComment);
+    assert.equal(insertComments.length, 2);
+  });
+
+  it('doc_suggest_replace_all: respects startIndex and endIndex scoping', async () => {
+    const res = await callTool('doc_suggest_replace_all', {
+      documentId: 'doc_test_123',
+      searchText: 'the',
+      replacementText: 'THE',
+      startIndex: 10,
+      endIndex: 50,
+    });
+
+    assert.equal(res.status, 'ok');
+  });
+
+  it('doc_read_table: returns markdown table and matrix', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_read_table', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      format: 'both',
+    });
+
+    assert.equal(res.tableIndex, 0);
+    assert.ok(typeof res.markdown === 'string');
+    assert.ok(Array.isArray(res.matrix));
+  });
+
+  it('doc_insert_table_row: inserts row above or below', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_insert_table_row', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      rowIndex: 0,
+      position: 'BELOW',
+      cells: ['New Cell 1', 'New Cell 2'],
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.position, 'BELOW');
+    const rowCall = backend.batchCalls.find((c) => c.requests.some((r: any) => r.insertTableRow));
+    assert.ok(rowCall);
+  });
+
+  it('doc_batch_manage_comments: handles RESOLVE_ALL, commentIds, and operations', async () => {
+    // RESOLVE_ALL
+    const resAll = await callTool('doc_batch_manage_comments', {
+      documentId: 'doc_test_123',
+      action: 'RESOLVE_ALL',
+      replyText: 'Resolved in batch review.',
+    });
+    assert.equal(resAll.status, 'ok');
+
+    // commentIds list
+    const resList = await callTool('doc_batch_manage_comments', {
+      documentId: 'doc_test_123',
+      action: 'RESOLVE',
+      commentIds: ['comment_1'],
+    });
+    assert.equal(resList.status, 'ok');
+
+    // Heterogeneous operations
+    const resOps = await callTool('doc_batch_manage_comments', {
+      documentId: 'doc_test_123',
+      operations: [
+        { commentId: 'comment_1', action: 'RESOLVE', replyText: 'Done' },
+        { commentId: 'comment_2', action: 'DELETE' },
+      ],
+    });
+    assert.equal(resOps.status, 'ok');
+    assert.equal(resOps.count, 2);
+  });
+
+  it('doc_batch_add_comments: creates multiple anchored comments atomically', async () => {
+    const res = await callTool('doc_batch_add_comments', {
+      documentId: 'doc_test_123',
+      comments: [
+        { startIndex: 15, endIndex: 25, commentText: 'First batch comment' },
+        { startIndex: 40, endIndex: 50, commentText: 'Second batch comment' },
+      ],
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.count, 2);
+    assert.equal(res.createdCommentIds.length, 2);
   });
 });

@@ -27,6 +27,8 @@ import {
   type DocModel,
   type IndexRange,
   type TabModel,
+  type TableCellModel,
+  type TableModel,
 } from './docModel.js';
 import {
   DEFAULT_REDLINE_REPLACEMENT_STYLE,
@@ -391,20 +393,133 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'doc_get_changes_summary',
+    {
+      title: 'Get document changes summary & editorial digest',
+      description:
+        'Provides a high-level changelog and editorial digest of all pending suggestions and open comments grouped by outline section. ' +
+        'Ideal for summarizing changes, drafting revision cover letters, and updating version history tables.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tabId: tabIdSchema,
+      },
+      annotations: RO,
+    },
+    safe(async ({ documentId, tabId }) => {
+      const m = await load(documentId);
+      const tab = getTab(m, tabId);
+      const outline = tab.outline ?? [];
+      const threads = new Map(m.suggestionThreads.map((s) => [s.suggestionId, s]));
+      const suggestions: Array<{
+        suggestionId: string;
+        kinds: string[];
+        startIndex: number;
+        endIndex: number;
+        text: string;
+        author?: string;
+      }> = [];
+
+      for (const [id, span] of tab.suggestionSpans) {
+        const th = threads.get(id);
+        const sStart = span.ranges[0].startIndex;
+        const sEnd = span.ranges[span.ranges.length - 1].endIndex;
+        suggestions.push({
+          suggestionId: id,
+          kinds: [...span.kinds],
+          startIndex: sStart,
+          endIndex: sEnd,
+          text: truncate(span.ranges.map((r) => renderText(tab, r.startIndex, r.endIndex)).join(' … '), 120),
+          author: th?.author,
+        });
+      }
+
+      const comments = m.commentsAvailable ? m.comments : [];
+
+      const suggestionsByAuthor: Record<string, number> = {};
+      const suggestionsByKind: Record<string, number> = {};
+      for (const s of suggestions) {
+        const author = s.author ?? 'Unknown';
+        suggestionsByAuthor[author] = (suggestionsByAuthor[author] ?? 0) + 1;
+        for (const k of s.kinds) {
+          suggestionsByKind[k] = (suggestionsByKind[k] ?? 0) + 1;
+        }
+      }
+
+      const openComments = comments.filter((c) => c.status === 'OPEN');
+      const commentsByAuthor: Record<string, number> = {};
+      for (const c of openComments) {
+        const author = c.head?.author ?? 'Unknown';
+        commentsByAuthor[author] = (commentsByAuthor[author] ?? 0) + 1;
+      }
+
+      const sectionsWithChanges: any[] = [];
+      for (const heading of outline) {
+        const sStart = heading.startIndex;
+        const sEnd = heading.sectionEndIndex ?? tab.endIndex;
+
+        const secSuggestions = suggestions.filter((s) => s.endIndex > sStart && s.startIndex < sEnd);
+        const secComments = openComments.filter((c) => {
+          const a = anchorSummary(m, c);
+          return a.anchored && a.endIndex !== undefined && a.startIndex !== undefined && a.endIndex > sStart && a.startIndex < sEnd;
+        });
+
+        if (secSuggestions.length > 0 || secComments.length > 0) {
+          sectionsWithChanges.push({
+            title: heading.title,
+            level: heading.level,
+            startIndex: sStart,
+            endIndex: sEnd,
+            suggestionCount: secSuggestions.length,
+            openCommentCount: secComments.length,
+            suggestionsSummary: secSuggestions.slice(0, 10).map((s) => ({
+              suggestionId: s.suggestionId,
+              author: s.author,
+              kinds: s.kinds,
+              summary: s.text,
+            })),
+            openCommentsSummary: secComments.slice(0, 10).map((c) => ({
+              commentId: c.commentId,
+              author: c.head?.author,
+              content: truncate(c.head?.content ?? '', 120),
+            })),
+          });
+        }
+      }
+
+      return ok({
+        revisionId: m.revisionId,
+        totalPendingSuggestions: suggestions.length,
+        totalOpenComments: openComments.length,
+        totalResolvedComments: comments.length - openComments.length,
+        suggestionsByAuthor,
+        suggestionsByKind,
+        openCommentsByAuthor: commentsByAuthor,
+        sectionsWithChangesCount: sectionsWithChanges.length,
+        sectionsWithChanges,
+      });
+    }),
+  );
+
+  server.registerTool(
     'doc_list_comments',
     {
       title: 'List comments',
       description:
-        'Surveys all comments in the document. Returns compact summaries (author, status, anchor text, content snippet, and exact [startIndex, endIndex) coordinates). Prefer status="OPEN" to find unresolved feedback.',
+        'Surveys all comments in the document. Returns compact summaries (author, status, anchor text, content snippet, and exact [startIndex, endIndex) coordinates). Prefer status="OPEN" to find unresolved feedback. Supports filtering by author, keyword query, range, and grouping by outline section.',
       inputSchema: {
         documentId: documentIdSchema,
         status: z.enum(['OPEN', 'RESOLVED', 'ALL']).optional().describe('Default "OPEN".'),
+        author: z.string().optional().describe('Filter by author name or email (case-insensitive substring).'),
+        query: z.string().optional().describe('Search in comment content, anchor text, or replies (case-insensitive substring).'),
+        startIndex: indexSchema.optional().describe('Filter comments anchored at or after this character index.'),
+        endIndex: indexSchema.optional().describe('Filter comments anchored at or before this character index.'),
+        groupBySection: z.boolean().optional().describe('Group returned comments under document outline section headings (default false).'),
         tabId: tabIdSchema.describe('Only return comments anchored in this tab (omit for all tabs).'),
         maxResults: z.number().int().min(1).max(500).optional().describe('Default 100.'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, status, tabId, maxResults }) => {
+    safe(async ({ documentId, status, author, query, startIndex, endIndex, groupBySection, tabId, maxResults }) => {
       const m = await load(documentId);
       if (!m.commentsAvailable) {
         return ok({
@@ -421,6 +536,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (st !== 'ALL' && c.status !== st) continue;
         const a = anchorSummary(m, c);
         if (tabId && a.anchored && a.tab.tabId !== tabId) continue;
+        if (author && !c.head?.author?.toLowerCase().includes(author.toLowerCase())) continue;
+        if (query) {
+          const q = query.toLowerCase();
+          const matchContent = c.head?.content?.toLowerCase().includes(q) ?? false;
+          const matchAnchor = a.anchorText ? a.anchorText.toLowerCase().includes(q) : false;
+          const matchReplies = c.replies.some((r) => r.content?.toLowerCase().includes(q));
+          if (!matchContent && !matchAnchor && !matchReplies) continue;
+        }
+        if (startIndex !== undefined && a.endIndex !== undefined && a.endIndex < startIndex) continue;
+        if (endIndex !== undefined && a.startIndex !== undefined && a.startIndex > endIndex) continue;
+
+        let sectionTitle = 'Preamble / Untitled';
+        if (a.anchored && a.startIndex !== undefined) {
+          const outline = a.tab.outline ?? [];
+          const heading = outline.slice().reverse().find((h) => h.startIndex <= a.startIndex! && (h.sectionEndIndex ? a.startIndex! < h.sectionEndIndex : true));
+          if (heading) sectionTitle = heading.title;
+        }
+
         rows.push({
           commentId: c.commentId,
           status: c.status,
@@ -431,6 +564,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           lastReply: c.replies.length ? truncate(c.replies[c.replies.length - 1].content, 200) : undefined,
           anchored: a.anchored,
           anchorStatus: a.anchorStatus,
+          section: sectionTitle,
           tabId: a.anchored && m.tabs.length > 1 ? a.tab.tabId : undefined,
           startIndex: a.startIndex,
           endIndex: a.endIndex,
@@ -438,6 +572,22 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         });
         if (rows.length >= max) break;
       }
+
+      if (groupBySection) {
+        const sectionsMap = new Map<string, typeof rows>();
+        for (const r of rows) {
+          const sec = r.section ?? 'Preamble / Untitled';
+          if (!sectionsMap.has(sec)) sectionsMap.set(sec, []);
+          sectionsMap.get(sec)!.push(r);
+        }
+        const sections = Array.from(sectionsMap.entries()).map(([secTitle, cList]) => ({
+          sectionTitle: secTitle,
+          count: cList.length,
+          comments: cList,
+        }));
+        return ok({ revisionId: m.revisionId, totalMatched: rows.length, sections });
+      }
+
       return ok({ revisionId: m.revisionId, totalMatched: rows.length, comments: rows });
     }),
   );
@@ -947,6 +1097,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         revisionId?: string;
         tabId?: string;
         textStyle?: TextStyleInput;
+        commentText?: string;
       }) => {
         const id = parseDocumentId(args.documentId);
         const m = await ctx.cache.get(id, true);
@@ -962,7 +1113,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           },
           args.expectedText,
         );
-        const out = await runBatch(ctx, id, buildReplaceRequests(tab, planned), writeControlFor(ctx, m, mode));
+        const contentReqs = buildReplaceRequests(tab, planned);
+        const commentReqs: DocsRequest[] = [];
+        if (args.commentText) {
+          const cStart = planned.startIndex;
+          const cEnd = Math.max(cStart + 1, planned.endIndex);
+          const range: Record<string, unknown> = { startIndex: cStart, endIndex: Math.min(cEnd, tab.endIndex) };
+          if (tab.tabId) range.tabId = tab.tabId;
+          commentReqs.push({ insertComment: { range, content: args.commentText } });
+        }
+        const out =
+          commentReqs.length > 0
+            ? await runContentWithComments(ctx, id, contentReqs, commentReqs, writeControlFor(ctx, m, mode))
+            : await runBatch(ctx, id, contentReqs, writeControlFor(ctx, m, mode));
         return ok({
           status: 'ok',
           mode,
@@ -970,6 +1133,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           newText: planned.text,
           appliedStyle: planned.textStyle,
           createdSuggestionIds: mode === 'SUGGEST' ? suggestionIdsFrom(out.response, 'createdSuggestionIds') : undefined,
+          commentCreated: commentReqs.length > 0 && ('commentsApplied' in out ? (out as any).commentsApplied : true),
           newRevisionId: out.newRevisionId,
           warnings: planned.notes.length ? planned.notes : undefined,
         });
@@ -1024,6 +1188,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           .describe('The new replacement text. Pass empty string "" to suggest deleting the range. For pure insertion, set startIndex equal to endIndex.'),
         expectedText: expectedTextSchema,
         textStyle: textStyleSchema.describe('Styling applied to the NEW replacement text (e.g. bold: true). Does not affect deleted text.'),
+        commentText: z
+          .string()
+          .max(2048)
+          .optional()
+          .describe('Optional review comment / rationale to anchor to the edited range in the same atomic batch.'),
         revisionId: revisionIdSchema,
         tabId: tabIdSchema,
       },
@@ -1076,6 +1245,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         retainedStyle: textStyleSchema.describe('Styling for retained original text (default: { bold: true, strikethrough: true }). Set italic, color, etc. to match any party/stage guide.'),
         replacementStyle: textStyleSchema.describe('Styling for inserted replacement text (default: { bold: true, strikethrough: false }). Set italic, underline, color, etc.'),
         insertionPosition: z.enum(['AFTER', 'BEFORE']).optional().default('AFTER').describe('Whether replacement text appears AFTER original text (default) or BEFORE it.'),
+        commentText: z
+          .string()
+          .max(2048)
+          .optional()
+          .describe('Optional review comment / rationale to anchor to the amended range in the same atomic batch.'),
         revisionId: revisionIdSchema,
         tabId: tabIdSchema,
       },
@@ -1090,6 +1264,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       retainedStyle,
       replacementStyle,
       insertionPosition,
+      commentText,
       revisionId,
       tabId,
     }) => {
@@ -1118,13 +1293,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         insertionPosition,
       });
 
+      const commentReqs: DocsRequest[] = [];
+      if (commentText) {
+        const range: Record<string, unknown> = { startIndex, endIndex };
+        if (tab.tabId) range.tabId = tab.tabId;
+        commentReqs.push({ insertComment: { range, content: commentText } });
+      }
+
       const wc = writeControlFor(ctx, m, 'SUGGEST');
-      const out = await runBatch(ctx, id, reqs, wc);
+      const out =
+        commentReqs.length > 0
+          ? await runContentWithComments(ctx, id, reqs, commentReqs, wc)
+          : await runBatch(ctx, id, reqs, wc);
       return ok({
         status: 'ok',
         documentId: id,
         newRevisionId: out.newRevisionId,
         createdSuggestionIds: suggestionIdsFrom(out.response, 'createdSuggestionIds'),
+        commentCreated: commentReqs.length > 0 && ('commentsApplied' in out ? (out as any).commentsApplied : true),
         notes: [
           `Applied redline amendment at [${startIndex}, ${endIndex}): retained original text styled with ` +
             JSON.stringify(retainedStyle ?? DEFAULT_REDLINE_RETAINED_STYLE) +
@@ -1166,6 +1352,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 .describe('If true, performs a styled redline amendment: original text is retained with retainedStyle (default bold strikethrough), and suggestedText is inserted with replacementStyle or textStyle (default bold).'),
               retainedStyle: textStyleSchema.describe('Style for retained original text when redline is true (default: bold strikethrough).'),
               replacementStyle: textStyleSchema.describe('Style for inserted replacement text when redline is true (defaults to textStyle or bold).'),
+              commentText: z
+                .string()
+                .max(2048)
+                .optional()
+                .describe('Optional review comment / rationale to anchor alongside this edit.'),
             }),
           )
           .min(1)
@@ -1183,6 +1374,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const planned: (PlannedEdit & {
         item: number;
         commentId?: string;
+        commentText?: string;
         isRedline?: boolean;
         retainedStyle?: TextStyleInput;
         replacementStyle?: TextStyleInput;
@@ -1218,6 +1410,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ...plan,
             item,
             commentId: e.commentId,
+            commentText: e.commentText,
             isRedline,
             retainedStyle: e.retainedStyle,
             replacementStyle: e.replacementStyle,
@@ -1242,11 +1435,20 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       });
       const resolve = resolveComments !== false;
       const commentIds = [...new Set(ordered.filter((p) => p.commentId).map((p) => p.commentId!))];
-      const commentReqs = resolve
+      const commentReqs: DocsRequest[] = resolve
         ? commentIds.map((cid) => commentReplyRequest(cid, replyMessage ?? DEFAULT_RESOLVE_REPLY, 'RESOLVE'))
         : replyMessage
           ? commentIds.map((cid) => commentReplyRequest(cid, replyMessage))
           : [];
+
+      for (const p of ordered) {
+        if (p.commentText && p.startIndex < p.endIndex) {
+          const range: Record<string, unknown> = { startIndex: p.startIndex, endIndex: p.endIndex };
+          if (tab!.tabId) range.tabId = tab!.tabId;
+          commentReqs.push({ insertComment: { range, content: p.commentText } });
+        }
+      }
+
       const out = await runContentWithComments(ctx, id, contentReqs, commentReqs, writeControlFor(ctx, m, 'SUGGEST'));
       const notes = planned.flatMap((p) => p.notes.map((n) => `edits[${p.item}]: ${n}`));
       return ok({
@@ -1337,6 +1539,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         retainedStyle: textStyleSchema.describe('Style for retained original text when redline is true (default: bold strikethrough).'),
         replacementStyle: textStyleSchema.describe('Style for inserted replacement text (default: bold, strikethrough: false).'),
         textStyle: textStyleSchema.describe('Styling for the replacement text in standard mode.'),
+        startIndex: indexSchema.optional().describe('Optional start index to bound the search/replace range.'),
+        endIndex: indexSchema.optional().describe('Optional end index to bound the search/replace range.'),
         tabId: tabIdSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -1350,6 +1554,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       retainedStyle,
       replacementStyle,
       textStyle,
+      startIndex,
+      endIndex,
       tabId,
     }) => {
       const id = parseDocumentId(documentId);
@@ -1361,10 +1567,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const text = tab.text;
       const needle = isCase ? target : target.toLowerCase();
       const haystack = isCase ? text : text.toLowerCase();
-      let pos = 0;
+      let pos = startIndex ?? 0;
+      const limit = endIndex ?? haystack.length;
       while ((pos = haystack.indexOf(needle, pos)) !== -1) {
         const start = pos;
         const end = pos + target.length;
+        if (end > limit) break;
         if (!text.slice(start, end).includes(GAP)) {
           matches.push({ startIndex: start, endIndex: end });
         }
@@ -1993,6 +2201,180 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'doc_read_table',
+    {
+      title: 'Read table contents & structure',
+      description:
+        'Reads a specific table from the document and returns it formatted as a Markdown table, a 2D cell text matrix, and/or structural cell coordinates. ' +
+        'Specify either tableIndex (0-based order of tables in tab) or tableStartIndex (start index from doc_inspect_tables).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tableIndex: z.number().int().nonnegative().optional().describe('0-based table index (first table is 0, second is 1, etc.).'),
+        tableStartIndex: indexSchema.optional().describe('Character start index of the table (from doc_inspect_tables).'),
+        format: z.enum(['markdown', 'matrix', 'both']).optional().default('both').describe('Output format: "markdown", "matrix", or "both" (default "both").'),
+        tabId: tabIdSchema,
+      },
+      annotations: RO,
+    },
+    safe(async ({ documentId, tableIndex, tableStartIndex, format, tabId }) => {
+      const m = await load(documentId);
+      const tab = getTab(m, tabId);
+      if (tab.tables.length === 0) {
+        return fail('No tables found in this tab.');
+      }
+
+      let targetTable: TableModel | undefined;
+      let resolvedIndex = 0;
+      if (tableStartIndex !== undefined) {
+        targetTable = tab.tables.find((t) => t.startIndex === tableStartIndex);
+        if (!targetTable) {
+          return fail(`No table found at tableStartIndex=${tableStartIndex}. Available table start indices: ${tab.tables.map((t) => t.startIndex).join(', ')}`);
+        }
+        resolvedIndex = tab.tables.indexOf(targetTable);
+      } else if (tableIndex !== undefined) {
+        if (tableIndex >= tab.tables.length) {
+          return fail(`tableIndex ${tableIndex} out of bounds. This tab has ${tab.tables.length} table(s) (indices 0 to ${tab.tables.length - 1}).`);
+        }
+        targetTable = tab.tables[tableIndex];
+        resolvedIndex = tableIndex;
+      } else {
+        targetTable = tab.tables[0];
+        resolvedIndex = 0;
+      }
+
+      // Build 2D matrix of cell content and coordinates
+      const matrix: { text: string; startIndex: number; endIndex: number }[][] = [];
+      for (let r = 0; r < targetTable.rows; r++) {
+        const row: { text: string; startIndex: number; endIndex: number }[] = [];
+        for (let c = 0; c < targetTable.columns; c++) {
+          const cell = targetTable.cells.find((cl) => cl.rowIndex === r && cl.columnIndex === c);
+          if (cell) {
+            const rawCellText = tab.text.slice(cell.startIndex, cell.endIndex).replace(/\x0B/g, '').replace(/\n+$/, '').trim();
+            row.push({ text: rawCellText, startIndex: cell.startIndex, endIndex: cell.endIndex });
+          } else {
+            row.push({ text: '', startIndex: 0, endIndex: 0 });
+          }
+        }
+        matrix.push(row);
+      }
+
+      // Build Markdown representation
+      let markdown = '';
+      if (format === 'markdown' || format === 'both') {
+        const lines: string[] = [];
+        if (matrix.length > 0) {
+          const header = '| ' + matrix[0].map((c) => c.text.replace(/\|/g, '\\|').replace(/\n/g, ' ')).join(' | ') + ' |';
+          const sep = '| ' + matrix[0].map(() => '---').join(' | ') + ' |';
+          lines.push(header);
+          lines.push(sep);
+          for (let r = 1; r < matrix.length; r++) {
+            lines.push('| ' + matrix[r].map((c) => c.text.replace(/\|/g, '\\|').replace(/\n/g, ' ')).join(' | ') + ' |');
+          }
+        }
+        markdown = lines.join('\n');
+      }
+
+      const textMatrix = matrix.map((row) => row.map((c) => c.text));
+
+      return ok({
+        tableIndex: resolvedIndex,
+        startIndex: targetTable.startIndex,
+        endIndex: targetTable.endIndex,
+        rows: targetTable.rows,
+        columns: targetTable.columns,
+        markdown: format === 'markdown' || format === 'both' ? markdown : undefined,
+        matrix: format === 'matrix' || format === 'both' ? textMatrix : undefined,
+        cellCoordinates: format === 'matrix' || format === 'both' ? matrix : undefined,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_insert_table_row',
+    {
+      title: 'Insert table row with contents',
+      description:
+        'Inserts a new row into an existing table and optionally populates its cells with text immediately in one atomic workflow. ' +
+        'Specify tableStartIndex or tableIndex, target rowIndex, position ("ABOVE" or "BELOW"), and optional cells: string[] array.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tableStartIndex: indexSchema.optional().describe('Start index of the table (from doc_inspect_tables or doc_read_table).'),
+        tableIndex: z.number().int().nonnegative().optional().describe('0-based table index (omit if tableStartIndex is provided).'),
+        rowIndex: z.number().int().nonnegative().describe('Target row index to insert next to (0-indexed).'),
+        position: z.enum(['ABOVE', 'BELOW']).optional().default('BELOW').describe('Whether to insert row ABOVE or BELOW target rowIndex (default "BELOW").'),
+        cells: z.array(z.string()).optional().describe('Optional array of strings to populate the newly inserted row cells with, from left to right.'),
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, tableStartIndex, tableIndex, rowIndex, position, cells, tabId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      const tab = getTab(m, tabId);
+      const tId = tab.tabId;
+
+      let targetTable: TableModel | undefined;
+      if (tableStartIndex !== undefined) {
+        targetTable = tab.tables.find((t) => t.startIndex === tableStartIndex);
+        if (!targetTable) return fail(`No table found at tableStartIndex=${tableStartIndex}.`);
+      } else if (tableIndex !== undefined) {
+        if (tableIndex >= tab.tables.length) return fail(`tableIndex ${tableIndex} out of bounds (${tab.tables.length} tables).`);
+        targetTable = tab.tables[tableIndex];
+      } else {
+        if (tab.tables.length === 0) return fail('No tables found in this tab.');
+        targetTable = tab.tables[0];
+      }
+
+      const insertBelow = position !== 'ABOVE';
+      const insertReq = buildInsertTableRowRequest(targetTable.startIndex, rowIndex, 0, insertBelow, tId);
+      const out = await runBatch(ctx, id, [insertReq], writeControlFor(ctx, m, 'EDIT'));
+
+      let cellsPopulated = 0;
+      let newRevisionId = out.newRevisionId;
+
+      if (cells && cells.length > 0) {
+        const freshModel = await ctx.cache.get(id, true);
+        const freshTab = getTab(freshModel, tabId);
+        const freshTable = freshTab.tables.find((t) => t.startIndex === targetTable!.startIndex) ??
+          freshTab.tables.find((t) => Math.abs(t.startIndex - targetTable!.startIndex) < 100);
+
+        if (freshTable) {
+          const newRowIdx = insertBelow ? rowIndex + 1 : rowIndex;
+          const populateReqs: DocsRequest[] = [];
+          const numCols = Math.min(freshTable.columns, cells.length);
+          for (let c = numCols - 1; c >= 0; c--) {
+            const text = cells[c];
+            if (!text) continue;
+            const targetCell = freshTable.cells.find((cell) => cell.rowIndex === newRowIdx && cell.columnIndex === c);
+            if (targetCell) {
+              populateReqs.push({
+                insertText: {
+                  location: { index: targetCell.startIndex, ...(tId ? { tabId: tId } : {}) },
+                  text,
+                },
+              });
+            }
+          }
+          if (populateReqs.length > 0) {
+            const popOut = await runBatch(ctx, id, populateReqs, writeControlFor(ctx, freshModel, 'EDIT'));
+            cellsPopulated = populateReqs.length;
+            newRevisionId = popOut.newRevisionId;
+          }
+        }
+      }
+
+      return ok({
+        status: 'ok',
+        tableStartIndex: targetTable.startIndex,
+        insertedRowIndex: insertBelow ? rowIndex + 1 : rowIndex,
+        position: position ?? 'BELOW',
+        cellsPopulated,
+        newRevisionId,
+      });
+    }),
+  );
+
+  server.registerTool(
     'doc_insert_image',
     {
       title: 'Insert inline image',
@@ -2131,6 +2513,182 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         return fail('The API reported that the deletion failed (commentUpdateState=ALL_FAILED_UNKNOWN_REASON).');
       }
       return ok({ status: 'ok', deleted: postId ? { commentId, postId } : { commentId }, newRevisionId: out.newRevisionId });
+    }),
+  );
+
+  server.registerTool(
+    'doc_batch_manage_comments',
+    {
+      title: 'Batch manage comments (reply, resolve, reopen, delete)',
+      description:
+        'Performs bulk comment operations in ONE atomic batchUpdate. Supports bulk resolving or reopening (including RESOLVE_ALL / REOPEN_ALL), bulk replies, bulk deletions, or heterogeneous operations per comment.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        action: z
+          .enum(['RESOLVE', 'REOPEN', 'DELETE', 'RESOLVE_ALL', 'REOPEN_ALL'])
+          .optional()
+          .describe('Batch action to apply across commentIds (or whole doc for RESOLVE_ALL / REOPEN_ALL).'),
+        commentIds: z
+          .array(z.string().min(1))
+          .optional()
+          .describe('List of commentIds to apply action to. Required when action is RESOLVE, REOPEN, or DELETE without operations.'),
+        replyText: z
+          .string()
+          .max(2048)
+          .optional()
+          .describe('Optional reply text attached to each resolved/reopened comment.'),
+        operations: z
+          .array(
+            z.object({
+              commentId: z.string().min(1),
+              action: z.enum(['RESOLVE', 'REOPEN', 'DELETE']).optional(),
+              replyText: z.string().max(2048).optional(),
+              postId: z.string().optional().describe('For DELETE: deletes specific reply instead of entire thread.'),
+            }),
+          )
+          .optional()
+          .describe('Heterogeneous per-comment operations list (alternative to uniform action + commentIds).'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    safe(async ({ documentId, action, commentIds, replyText, operations }) => {
+      const id = parseDocumentId(documentId);
+      const m = await load(documentId);
+      const reqs: DocsRequest[] = [];
+      const affectedCommentIds: string[] = [];
+
+      if (action === 'RESOLVE_ALL' || action === 'REOPEN_ALL') {
+        const targetStatus = action === 'RESOLVE_ALL' ? 'OPEN' : 'RESOLVED';
+        const newStatusAction = action === 'RESOLVE_ALL' ? 'RESOLVE' : 'REOPEN';
+        const eligible = m.comments.filter((c) => c.status === targetStatus);
+        for (const c of eligible) {
+          reqs.push(commentReplyRequest(c.commentId, replyText ?? DEFAULT_RESOLVE_REPLY, newStatusAction));
+          affectedCommentIds.push(c.commentId);
+        }
+      } else if (action && commentIds && commentIds.length > 0) {
+        for (const cid of commentIds) {
+          affectedCommentIds.push(cid);
+          if (action === 'DELETE') {
+            reqs.push({ deleteComment: { commentId: cid } });
+          } else {
+            reqs.push(commentReplyRequest(cid, replyText ?? DEFAULT_RESOLVE_REPLY, action));
+          }
+        }
+      } else if (operations && operations.length > 0) {
+        for (const op of operations) {
+          affectedCommentIds.push(op.commentId);
+          if (op.action === 'DELETE') {
+            reqs.push(op.postId ? { deleteCommentReply: { commentId: op.commentId, postId: op.postId } } : { deleteComment: { commentId: op.commentId } });
+          } else if (op.action || op.replyText) {
+            reqs.push(commentReplyRequest(op.commentId, op.replyText ?? (op.action === 'RESOLVE' ? DEFAULT_RESOLVE_REPLY : undefined), op.action));
+          }
+        }
+      } else {
+        return fail('Specify either action="RESOLVE_ALL"|"REOPEN_ALL", or action + commentIds, or an operations array.');
+      }
+
+      if (reqs.length === 0) {
+        return ok({
+          status: 'ok',
+          action: action ?? 'CUSTOM_OPERATIONS',
+          count: 0,
+          affectedCommentIds: [],
+          message: 'No eligible comments found matching criteria.',
+        });
+      }
+
+      const out = await runBatch(ctx, id, reqs);
+      if ((out.response as any).commentUpdateState === 'ALL_FAILED_UNKNOWN_REASON') {
+        return fail('The API reported that comment updates failed (commentUpdateState=ALL_FAILED_UNKNOWN_REASON).');
+      }
+
+      return ok({
+        status: 'ok',
+        action: action ?? 'CUSTOM_OPERATIONS',
+        count: reqs.length,
+        affectedCommentIds: [...new Set(affectedCommentIds)],
+        newRevisionId: out.newRevisionId,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_batch_add_comments',
+    {
+      title: 'Batch add anchored comments',
+      description:
+        'Creates multiple new inline comments anchored to spans across the document in ONE atomic batchUpdate. ' +
+        'Each item must specify startIndex, endIndex, and commentText, with optional expectedText validation and assigneeEmail.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        comments: z
+          .array(
+            z.object({
+              startIndex: indexSchema,
+              endIndex: indexSchema,
+              commentText: z.string().min(1).max(2048),
+              expectedText: expectedTextSchema,
+              assigneeEmail: z.string().email().optional(),
+            }),
+          )
+          .min(1)
+          .max(50),
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, comments, tabId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      const tab = getTab(m, tabId);
+      const reqs: DocsRequest[] = [];
+      const itemSummaries: any[] = [];
+
+      comments.forEach((c, idx) => {
+        if (c.startIndex < 1 || c.endIndex <= c.startIndex || c.endIndex > tab.endIndex) {
+          throw new EditValidationError(`comments[${idx}]: Invalid range [${c.startIndex}, ${c.endIndex}) for tab ending at ${tab.endIndex}.`);
+        }
+        const actual = tab.text.slice(c.startIndex, c.endIndex);
+        if (c.expectedText !== undefined && actual !== c.expectedText) {
+          if (normalizeExpectedText(actual) !== normalizeExpectedText(c.expectedText)) {
+            throw new EditValidationError(
+              `comments[${idx}]: Text at [${c.startIndex}, ${c.endIndex}) does not match expectedText. Current text: ${JSON.stringify(truncate(actual, 200))}.`,
+            );
+          }
+        }
+        const range: Record<string, unknown> = { startIndex: c.startIndex, endIndex: c.endIndex };
+        if (tab.tabId) range.tabId = tab.tabId;
+        const insertComment: Record<string, unknown> = { range, content: c.commentText };
+        if (c.assigneeEmail) insertComment.assigneeEmailAddress = c.assigneeEmail;
+        reqs.push({ insertComment });
+        itemSummaries.push({
+          startIndex: c.startIndex,
+          endIndex: c.endIndex,
+          anchorText: truncate(renderText(tab, c.startIndex, c.endIndex), 200),
+          commentText: truncate(c.commentText, 200),
+        });
+      });
+
+      const out = await runBatch(ctx, id, reqs, writeControlFor(ctx, m));
+      if ((out.response as any).commentUpdateState === 'ALL_FAILED_UNKNOWN_REASON') {
+        return fail('The API reported that comments could not be saved (commentUpdateState=ALL_FAILED_UNKNOWN_REASON).');
+      }
+
+      const createdCommentIds: string[] = [];
+      if (out.response.replies) {
+        for (const reply of out.response.replies as any[]) {
+          const cid = reply?.insertComment?.commentThread?.commentId;
+          if (cid) createdCommentIds.push(cid);
+        }
+      }
+
+      return ok({
+        status: 'ok',
+        count: reqs.length,
+        createdCommentIds,
+        comments: itemSummaries,
+        newRevisionId: out.newRevisionId,
+      });
     }),
   );
 

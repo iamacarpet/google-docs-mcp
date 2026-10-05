@@ -63,13 +63,20 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Pagination Controls: keepWithNext (keeps headings with the following paragraph), keepLinesTogether, avoidWidowAndOrphan, pageBreakBefore.
      * Lists: bulletPreset ('BULLET_DISC_CIRCLE_SQUARE', 'BULLET_CHECKBOX', 'NUMBERED_DECIMAL_ALPHA_ROMAN', etc.) or removeBullets.
 
-6. TABLES & IMAGES
-   - Tables:
-     * Read tables: Use doc_read_table to retrieve any table formatted as a Markdown table, a 2D text matrix, and cell index coordinates.
-     * Inspect tables: Survey table dimensions and coordinates via doc_inspect_tables.
-     * Insert tables: Use doc_insert_table (supports optional cells: string[][] 2D text matrix to populate cells immediately).
-     * Insert rows: Use doc_insert_table_row to add a row ABOVE or BELOW an existing row and optionally populate its cells with text in one atomic call.
-     * Modify structure: Add or remove rows/columns via doc_modify_table.
+6. TABLES (INCLUDING LARGE MULTI-LINE / MULTI-PARAGRAPH CELLS) & IMAGES
+   - Working with Tables & Multi-Line Cells (e.g. Legal briefs, Tribunals, EHCPs, or complex forms):
+     * The Single-Line Markdown Trap: Standard Markdown grid tables flatten multi-line cells into giant single lines (destroying paragraph breaks, lists, and formatting).
+     * BEST PRACTICE FOR MULTI-LINE CELLS: Use doc_read_table with format: "record" (or format: "all"). This outputs a structured block/card view per row and column that preserves all paragraphs, bullet points, headers, rich formatting (bold, strikethrough), and tracked changes ([-deleted-]/{+inserted+}), alongside exact character coordinates!
+     * Single-Cell Inspection: Use doc_read_table_cell to target a specific cell by (tableIndex, rowIndex, columnIndex). It returns the resolved column header, paragraph count, exact bounds, and safe insertion offsets without loading unnecessary document content.
+     * Table Inspection: Use doc_inspect_tables to survey table dimensions, rows, columns, and index coordinates.
+     * Cell Insertion / Appending (Avoiding Docs API Delimiter Errors):
+       - Google Docs API table cells end with a structural newline delimiter. Inserting at cell.endIndex triggers an invalid index error!
+       - ALWAYS use doc_append_to_table_cell (or insert at safeAppendIndex = cell.endIndex - 1) to append text to a table cell safely.
+       - Supports position: 'END' (default) or position: 'START', writeMode: 'SUGGEST' (default) or 'EDIT', textStyle formatting, and rationale comments.
+     * Insert & Modify Structure:
+       - Use doc_insert_table to create a new table (supports optional cells 2D array).
+       - Use doc_insert_table_row to add a row ABOVE or BELOW an existing row, optionally populating cells with text atomically.
+       - Use doc_modify_table to insert/delete rows and columns.
    - Images: Insert inline images via doc_insert_image from public HTTPS URLs with optional widthPt and heightPt.
 
 7. CHARACTER COORDINATES & INDEX INTEGRITY
@@ -115,6 +122,17 @@ Steps:
 2. Fetch the document outline hierarchy with doc_get_outline.
 3. If tables are present, inspect their dimensions and structure with doc_inspect_tables (using includeCellText=false for a compact survey).
 4. Provide a structured report of the document's sections, tables, and formatting profile.`;
+}
+
+export function reviewTableSectionPrompt(documentId: string, tableIndex?: number): string {
+  return `Review and analyze tabular sections in Google Doc ${documentId}${tableIndex !== undefined ? ` (table index: ${tableIndex})` : ''}.
+
+Steps:
+1. Call doc_inspect_tables to survey all tables in the document and understand their dimensions, rows, columns, and index coordinates.
+2. For tables containing large multi-line or multi-paragraph cells (e.g. legal working documents, tribunal schedules, EHCPs), call doc_read_table with format: "record".
+   - This preserves all paragraphs, bullet points, headers, and tracked suggestions without flattening them into an unreadable single line.
+3. To inspect a specific cell or column (e.g. provision vs needs), use doc_read_table_cell with the target rowIndex and columnIndex.
+4. If appending new points or amendments to a table cell, use doc_append_to_table_cell in SUGGEST mode to automatically prevent Google Docs API cell delimiter errors.`;
 }
 
 export function registerPrompts(server: McpServer): void {
@@ -181,6 +199,29 @@ export function registerPrompts(server: McpServer): void {
           content: {
             type: 'text',
             text: inspectLayoutPrompt(args.documentId),
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    'review_table_section',
+    {
+      title: 'Review tabular sections and multi-line cells',
+      description: 'Surveys and inspects tabular document sections with multi-line paragraphs, bullets, and tracked changes.',
+      argsSchema: {
+        documentId: z.string().describe('Google Doc ID or URL'),
+        tableIndex: z.number().int().nonnegative().optional().describe('0-based table index to focus on (optional)'),
+      },
+    },
+    (args) => ({
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: reviewTableSectionPrompt(args.documentId, args.tableIndex),
           },
         },
       ],

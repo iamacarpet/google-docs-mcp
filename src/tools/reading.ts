@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   findComment,
+  getCellsInRange,
   getImagesInRange,
   getParagraphsInRange,
   getRunsInRange,
@@ -341,6 +342,17 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
         }
         const tblContext = getTableContext(tab, start);
         if (tblContext) res.tableContext = tblContext;
+        const cellsInRange = getCellsInRange(tab, start, end);
+        if (cellsInRange.length > 0) {
+          res.cells = cellsInRange.map((c) => ({
+            tableIndex: c.tableIndex,
+            rowIndex: c.rowIndex,
+            columnIndex: c.columnIndex,
+            startIndex: c.startIndex,
+            endIndex: c.endIndex,
+            safeAppendIndex: c.safeAppendIndex,
+          }));
+        }
         if (includeTables !== false) {
           const tablesInRange = getTablesInRange(tab, start, end);
           if (tablesInRange.length) {
@@ -433,18 +445,34 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
     {
       title: 'Read table contents & structure',
       description:
-        'Reads a specific table from the document and returns it formatted as a Markdown table, a 2D cell text matrix, and/or structural cell coordinates. ' +
-        'Specify either tableIndex (0-based order of tables in tab) or tableStartIndex (start index from doc_inspect_tables).',
+        'Reads a specific table from the document and returns it formatted as a structured Record view ("record"), a standard GFM Markdown table ("markdown"), a 2D text matrix ("matrix"), or "both"/"all". ' +
+        'CRITICAL FOR LARGE MULTI-LINE CELLS (e.g. tribunal or legal documents): Use format: "record" (or "all") to view multi-paragraph cells cleanly with intact paragraph breaks, bullet points, headers, and tracked suggestions, avoiding the single-line collapse of standard Markdown tables.',
       inputSchema: {
         documentId: documentIdSchema,
         tableIndex: z.number().int().nonnegative().optional().describe('0-based table index (first table is 0, second is 1, etc.).'),
         tableStartIndex: indexSchema.optional().describe('Character start index of the table (from doc_inspect_tables).'),
-        format: z.enum(['markdown', 'matrix', 'both']).optional().default('both').describe('Output format: "markdown", "matrix", or "both" (default "both").'),
+        format: z
+          .enum(['markdown', 'matrix', 'record', 'both', 'all'])
+          .optional()
+          .default('both')
+          .describe(
+            'Output format: "record" (best for large multi-line cells; preserves paragraphs and bullets), "markdown" (standard GFM table), "matrix" (2D text array), "both" (default: markdown + matrix), or "all" (record + markdown + matrix).'
+          ),
+        includeAnnotatedText: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe('Preserve rich text styling (bold, italic, strikethrough, links) in cell content. Default true.'),
+        markSuggestions: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe('Show pending suggestions as [-deleted-] and {+inserted+}. Default true.'),
         tabId: tabIdSchema,
       },
       annotations: RO,
     },
-    safe(async ({ documentId, tableIndex, tableStartIndex, format, tabId }) => {
+    safe(async ({ documentId, tableIndex, tableStartIndex, format, includeAnnotatedText, markSuggestions, tabId }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
       if (tab.tables.length === 0) {
@@ -470,39 +498,120 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
         resolvedIndex = 0;
       }
 
+      const mark = markSuggestions !== false;
+      const rich = includeAnnotatedText !== false;
+
       // Build 2D matrix of cell content and coordinates
-      const matrix: { text: string; startIndex: number; endIndex: number }[][] = [];
+      const matrix: {
+        text: string;
+        annotatedText: string;
+        startIndex: number;
+        endIndex: number;
+        safeAppendIndex: number;
+      }[][] = [];
+
       for (let r = 0; r < targetTable.rows; r++) {
-        const row: { text: string; startIndex: number; endIndex: number }[] = [];
+        const row: {
+          text: string;
+          annotatedText: string;
+          startIndex: number;
+          endIndex: number;
+          safeAppendIndex: number;
+        }[] = [];
         for (let c = 0; c < targetTable.columns; c++) {
           const cell = targetTable.cells.find((cl) => cl.rowIndex === r && cl.columnIndex === c);
           if (cell) {
-            const rawCellText = tab.text.slice(cell.startIndex, cell.endIndex).replace(/\x0B/g, '').replace(/\n+$/, '').trim();
-            row.push({ text: rawCellText, startIndex: cell.startIndex, endIndex: cell.endIndex });
+            const rawCellText = renderText(tab, cell.startIndex, cell.endIndex, mark)
+              .replace(/\x0B/g, '')
+              .replace(/\n+$/, '')
+              .trim();
+            const annCellText = renderAnnotatedText(tab, cell.startIndex, cell.endIndex, mark)
+              .replace(/\x0B/g, '')
+              .replace(/\n+$/, '')
+              .trim();
+            row.push({
+              text: rawCellText,
+              annotatedText: annCellText,
+              startIndex: cell.startIndex,
+              endIndex: cell.endIndex,
+              safeAppendIndex: Math.max(cell.startIndex, cell.endIndex - 1),
+            });
           } else {
-            row.push({ text: '', startIndex: 0, endIndex: 0 });
+            row.push({ text: '', annotatedText: '', startIndex: 0, endIndex: 0, safeAppendIndex: 0 });
           }
         }
         matrix.push(row);
       }
 
-      // Build Markdown representation
-      let markdown = '';
-      if (format === 'markdown' || format === 'both') {
+      // Infer column headers from row 0 if multi-row table
+      const columnHeaders: string[] = [];
+      if (matrix.length > 0) {
+        for (let c = 0; c < targetTable.columns; c++) {
+          const firstRowCellText = matrix[0][c]?.text ?? '';
+          const firstLine = firstRowCellText.split('\n')[0]?.trim();
+          columnHeaders.push(firstLine && firstLine.length < 80 ? firstLine : `Column ${c}`);
+        }
+      }
+
+      // Build Record representation (blocks per row and column)
+      let recordMarkdown: string | undefined;
+      if (format === 'record' || format === 'all') {
+        const recLines: string[] = [];
+        recLines.push(`### Table ${resolvedIndex} (${targetTable.rows} rows × ${targetTable.columns} columns, range [${targetTable.startIndex}, ${targetTable.endIndex}))`);
+        recLines.push('');
+
+        for (let r = 0; r < matrix.length; r++) {
+          const isHeaderRow = r === 0 && matrix.length > 1;
+          recLines.push('---');
+          recLines.push(`#### Row ${r}${isHeaderRow ? ' (Header Row)' : ''}`);
+          recLines.push('');
+
+          for (let c = 0; c < targetTable.columns; c++) {
+            const cell = matrix[r][c];
+            const headerLabel = columnHeaders[c] || `Column ${c}`;
+            const content = rich ? cell.annotatedText : cell.text;
+            recLines.push(`##### Row ${r}, Col ${c}: ${headerLabel} \`[${cell.startIndex}, ${cell.endIndex})\` (safeAppendIndex: \`${cell.safeAppendIndex}\`)`);
+            recLines.push('');
+            if (content) {
+              recLines.push(content);
+            } else {
+              recLines.push('*(empty)*');
+            }
+            recLines.push('');
+          }
+        }
+        recordMarkdown = recLines.join('\n');
+      }
+
+      // Build standard GFM Markdown representation
+      let markdown: string | undefined;
+      if (format === 'markdown' || format === 'both' || format === 'all') {
         const lines: string[] = [];
         if (matrix.length > 0) {
-          const header = '| ' + matrix[0].map((c) => c.text.replace(/\|/g, '\\|').replace(/\n/g, ' ')).join(' | ') + ' |';
+          const getCellGfm = (c: typeof matrix[0][0]) => {
+            const t = rich ? c.annotatedText : c.text;
+            return t.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+          };
+          const header = '| ' + matrix[0].map(getCellGfm).join(' | ') + ' |';
           const sep = '| ' + matrix[0].map(() => '---').join(' | ') + ' |';
           lines.push(header);
           lines.push(sep);
           for (let r = 1; r < matrix.length; r++) {
-            lines.push('| ' + matrix[r].map((c) => c.text.replace(/\|/g, '\\|').replace(/\n/g, ' ')).join(' | ') + ' |');
+            lines.push('| ' + matrix[r].map(getCellGfm).join(' | ') + ' |');
           }
         }
         markdown = lines.join('\n');
       }
 
-      const textMatrix = matrix.map((row) => row.map((c) => c.text));
+      const textMatrix = matrix.map((row) => row.map((c) => (rich ? c.annotatedText : c.text)));
+      const coordsMatrix = matrix.map((row) =>
+        row.map((c) => ({
+          text: rich ? c.annotatedText : c.text,
+          startIndex: c.startIndex,
+          endIndex: c.endIndex,
+          safeAppendIndex: c.safeAppendIndex,
+        }))
+      );
 
       return ok({
         tableIndex: resolvedIndex,
@@ -510,9 +619,111 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
         endIndex: targetTable.endIndex,
         rows: targetTable.rows,
         columns: targetTable.columns,
-        markdown: format === 'markdown' || format === 'both' ? markdown : undefined,
-        matrix: format === 'matrix' || format === 'both' ? textMatrix : undefined,
-        cellCoordinates: format === 'matrix' || format === 'both' ? matrix : undefined,
+        columnHeaders,
+        record: format === 'record' || format === 'all' ? recordMarkdown : undefined,
+        markdown: format === 'markdown' || format === 'both' || format === 'all' ? markdown : undefined,
+        matrix: format === 'matrix' || format === 'both' || format === 'all' ? textMatrix : undefined,
+        cellCoordinates: format === 'matrix' || format === 'both' || format === 'all' ? coordsMatrix : undefined,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_read_table_cell',
+    {
+      title: 'Read single table cell',
+      description:
+        'Reads a single cell from a table by rowIndex and columnIndex. ' +
+        'Preserves multi-paragraph layouts, bullet points, rich text annotations (bold, strikethrough), and tracked suggestions ([-deleted-]/{+inserted+}). ' +
+        'Returns exact character coordinates, paragraph count, safeAppendIndex (for appending without Google Docs API cell delimiter errors), safePrependIndex, and resolved column header.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tableIndex: z.number().int().nonnegative().optional().describe('0-based table index (omit if tableStartIndex is provided).'),
+        tableStartIndex: indexSchema.optional().describe('Start index of the table (from doc_inspect_tables).'),
+        rowIndex: z.number().int().nonnegative().describe('Target row index (0-indexed).'),
+        columnIndex: z.number().int().nonnegative().describe('Target column index (0-indexed).'),
+        includeAnnotatedText: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe('Preserve rich text formatting (bold, italic, etc.). Default true.'),
+        markSuggestions: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe('Show pending suggestions as [-deleted-] and {+inserted+}. Default true.'),
+        tabId: tabIdSchema,
+      },
+      annotations: RO,
+    },
+    safe(async ({ documentId, tableIndex, tableStartIndex, rowIndex, columnIndex, includeAnnotatedText, markSuggestions, tabId }) => {
+      const m = await load(documentId);
+      const tab = getTab(m, tabId);
+      if (tab.tables.length === 0) return fail('No tables found in this tab.');
+
+      let targetTable: TableModel | undefined;
+      let resolvedIndex = 0;
+      if (tableStartIndex !== undefined) {
+        targetTable = tab.tables.find((t) => t.startIndex === tableStartIndex);
+        if (!targetTable) return fail(`No table found at tableStartIndex=${tableStartIndex}. Available table start indices: ${tab.tables.map((t) => t.startIndex).join(', ')}`);
+        resolvedIndex = tab.tables.indexOf(targetTable);
+      } else if (tableIndex !== undefined) {
+        if (tableIndex >= tab.tables.length) return fail(`tableIndex ${tableIndex} out of bounds (${tab.tables.length} tables in tab).`);
+        targetTable = tab.tables[tableIndex];
+        resolvedIndex = tableIndex;
+      } else {
+        targetTable = tab.tables[0];
+        resolvedIndex = 0;
+      }
+
+      if (rowIndex >= targetTable.rows) {
+        return fail(`rowIndex ${rowIndex} out of bounds for table with ${targetTable.rows} row(s).`);
+      }
+      if (columnIndex >= targetTable.columns) {
+        return fail(`columnIndex ${columnIndex} out of bounds for table with ${targetTable.columns} column(s).`);
+      }
+
+      const cell = targetTable.cells.find((c) => c.rowIndex === rowIndex && c.columnIndex === columnIndex);
+      if (!cell) {
+        return fail(`Cell at row ${rowIndex}, column ${columnIndex} not found.`);
+      }
+
+      // Column header lookup
+      let columnHeader: string | undefined;
+      if (targetTable.rows > 1 && rowIndex > 0) {
+        const headerCell = targetTable.cells.find((c) => c.rowIndex === 0 && c.columnIndex === columnIndex);
+        if (headerCell) {
+          const hText = renderText(tab, headerCell.startIndex, headerCell.endIndex, false)
+            .replace(/[\x00\x0B]/g, '')
+            .trim();
+          columnHeader = hText.split('\n')[0]?.trim();
+        }
+      }
+
+      const mark = markSuggestions !== false;
+      const plainText = renderText(tab, cell.startIndex, cell.endIndex, mark).replace(/\x0B/g, '').replace(/\n+$/, '');
+      const annotated = renderAnnotatedText(tab, cell.startIndex, cell.endIndex, mark).replace(/\x0B/g, '').replace(/\n+$/, '');
+      const safeAppendIndex = Math.max(cell.startIndex, cell.endIndex - 1);
+      const safePrependIndex = cell.startIndex;
+      const suggestions = getSuggestionsInRange(tab, cell.startIndex, cell.endIndex);
+      const paragraphs = getParagraphsInRange(tab, cell.startIndex, cell.endIndex);
+
+      return ok({
+        tableIndex: resolvedIndex,
+        tableStartIndex: targetTable.startIndex,
+        tableEndIndex: targetTable.endIndex,
+        rowIndex,
+        columnIndex,
+        columnHeader,
+        startIndex: cell.startIndex,
+        endIndex: cell.endIndex,
+        safeAppendIndex,
+        safePrependIndex,
+        characterCount: cell.endIndex - cell.startIndex,
+        paragraphCount: paragraphs.length,
+        text: plainText,
+        annotatedText: includeAnnotatedText !== false ? annotated : undefined,
+        pendingSuggestions: suggestions.length ? suggestions : undefined,
       });
     }),
   );

@@ -890,6 +890,17 @@ export function getTableContext(
           };
         }
       }
+      if (table.cells.length > 0 && index < table.cells[0].startIndex) {
+        const first = table.cells[0];
+        return {
+          tableIndex: table.tableIndex,
+          tableStart: table.startIndex,
+          tableEnd: table.endIndex,
+          rowIndex: first.rowIndex,
+          columnIndex: first.columnIndex,
+          cellRange: { startIndex: first.startIndex, endIndex: first.endIndex },
+        };
+      }
       return {
         tableIndex: table.tableIndex,
         tableStart: table.startIndex,
@@ -901,6 +912,32 @@ export function getTableContext(
     }
   }
   return null;
+}
+
+export interface TableCellWithContext extends TableCellModel {
+  tableIndex: number;
+  tableStartIndex: number;
+  tableEndIndex: number;
+  safeAppendIndex: number;
+}
+
+export function getCellsInRange(tab: TabModel, start: number, end: number): TableCellWithContext[] {
+  const out: TableCellWithContext[] = [];
+  for (const table of tab.tables) {
+    if (table.endIndex <= start || table.startIndex >= end) continue;
+    for (const cell of table.cells) {
+      if (cell.endIndex > start && cell.startIndex < end) {
+        out.push({
+          ...cell,
+          tableIndex: table.tableIndex,
+          tableStartIndex: table.startIndex,
+          tableEndIndex: table.endIndex,
+          safeAppendIndex: Math.max(cell.startIndex, cell.endIndex - 1),
+        });
+      }
+    }
+  }
+  return out;
 }
 
 export function getImagesInRange(tab: TabModel, start: number, end: number): ImageModel[] {

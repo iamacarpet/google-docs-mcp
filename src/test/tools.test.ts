@@ -736,6 +736,102 @@ describe('MCP Tools', () => {
     assert.ok(Array.isArray(res.matrix));
   });
 
+  it('doc_read_table: format record and all preserve multi-paragraph structure & coordinates', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_read_table', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      format: 'all',
+    });
+
+    assert.equal(res.tableIndex, 0);
+    assert.ok(res.record);
+    assert.ok(res.record.includes('### Table 0'));
+    assert.ok(res.record.includes('Row 0 (Header Row)'));
+    assert.ok(res.record.includes('safeAppendIndex:'));
+    assert.ok(res.markdown);
+    assert.ok(res.matrix);
+    assert.ok(res.cellCoordinates);
+    assert.equal(res.columnHeaders.length, 2);
+    assert.equal(res.columnHeaders[0], 'Requirement Item');
+  });
+
+  it('doc_read_table_cell: reads single cell with rich formatting and safeAppendIndex', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_read_table_cell', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      rowIndex: 1,
+      columnIndex: 1,
+    });
+
+    assert.equal(res.tableIndex, 0);
+    assert.equal(res.rowIndex, 1);
+    assert.equal(res.columnIndex, 1);
+    assert.equal(res.columnHeader, 'Proposed Deliverables');
+    assert.equal(res.startIndex, 131);
+    assert.equal(res.endIndex, 218);
+    assert.equal(res.safeAppendIndex, 217);
+    assert.equal(res.safePrependIndex, 131);
+    assert.ok(res.annotatedText.includes('Deliverable includes'));
+  });
+
+  it('doc_append_to_table_cell: safely appends or prepends to cell without delimiter errors', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+
+    // Append to END
+    const resAppend = await callTool('doc_append_to_table_cell', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      rowIndex: 1,
+      columnIndex: 0,
+      text: 'Additional Scope Line',
+      writeMode: 'SUGGEST',
+    });
+
+    assert.equal(resAppend.status, 'ok');
+    assert.equal(resAppend.position, 'END');
+    assert.equal(resAppend.insertedIndex, 129); // cell.endIndex - 1 (130 - 1)
+    const appendCall = backend.batchCalls[backend.batchCalls.length - 1];
+    assert.ok(appendCall.requests.some((r: any) => r.insertText?.location?.index === 129));
+
+    // Prepend to START
+    const resPrepend = await callTool('doc_append_to_table_cell', {
+      documentId: 'doc_formatted_001',
+      tableIndex: 0,
+      rowIndex: 1,
+      columnIndex: 0,
+      text: 'Prefix Scope: ',
+      position: 'START',
+      writeMode: 'SUGGEST',
+    });
+
+    assert.equal(resPrepend.status, 'ok');
+    assert.equal(resPrepend.position, 'START');
+    assert.equal(resPrepend.insertedIndex, 106); // cell.startIndex
+    const prependCall = backend.batchCalls[backend.batchCalls.length - 1];
+    assert.ok(prependCall.requests.some((r: any) => r.insertText?.location?.index === 106));
+  });
+
+  it('doc_read_range: returns cells array when spanning table cells', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_read_range', {
+      documentId: 'doc_formatted_001',
+      startIndex: 60,
+      endIndex: 120,
+    });
+
+    assert.ok(res.cells);
+    assert.ok(res.cells.length > 0);
+    assert.equal(res.cells[0].tableIndex, 0);
+    assert.equal(res.cells[0].rowIndex, 0);
+    assert.ok(typeof res.cells[0].safeAppendIndex === 'number');
+  });
+
   it('doc_insert_table_row: inserts row above or below', async () => {
     backend.rawDoc = createFormattedDocument();
     cache.clear();

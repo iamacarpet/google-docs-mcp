@@ -37,6 +37,7 @@ import {
   paragraphBorderSchema,
   revisionIdSchema,
   runBatch,
+  runContentWithComments,
   safe,
   suggestionIdsFrom,
   tabIdSchema,
@@ -621,5 +622,165 @@ export function registerFormattingTools(server: McpServer, ctx: ToolContext): vo
         newRevisionId: out.newRevisionId,
       });
     }),
+  );
+
+  server.registerTool(
+    'doc_append_to_table_cell',
+    {
+      title: 'Append text to table cell safely',
+      description:
+        'Safely appends (or prepends) text to a specific table cell without encountering Google Docs API end-of-cell index errors. ' +
+        'Automatically resolves the safe insertion index before the terminating cell delimiter, handles newline spacing, and supports both SUGGEST (default tracked suggestion) and EDIT modes with optional formatting and rationale comments.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tableIndex: z.number().int().nonnegative().optional().describe('0-based table index (omit if tableStartIndex is provided).'),
+        tableStartIndex: indexSchema.optional().describe('Start index of the table (from doc_inspect_tables).'),
+        rowIndex: z.number().int().nonnegative().describe('Target row index (0-indexed).'),
+        columnIndex: z.number().int().nonnegative().describe('Target column index (0-indexed).'),
+        text: z.string().min(1).describe('Text to append to the cell.'),
+        position: z.enum(['END', 'START']).optional().default('END').describe('Whether to append to the END (default) or prepend to the START of the cell.'),
+        ensureNewline: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe('If true (default), ensures the inserted text starts on a new paragraph/line if the cell already contains content.'),
+        writeMode: z
+          .enum(['SUGGEST', 'EDIT'])
+          .optional()
+          .default('SUGGEST')
+          .describe('SUGGEST (default tracked suggestion) or EDIT (direct overwrite).'),
+        textStyle: textStyleSchema.optional().describe('Optional styling to apply to the inserted text (bold, italic, etc.).'),
+        commentText: z.string().optional().describe('Optional rationale comment to anchor to the inserted text.'),
+        tabId: tabIdSchema,
+        revisionId: revisionIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(
+      async ({
+        documentId,
+        tableIndex,
+        tableStartIndex,
+        rowIndex,
+        columnIndex,
+        text,
+        position,
+        ensureNewline,
+        writeMode,
+        textStyle,
+        commentText,
+        tabId,
+        revisionId,
+      }) => {
+        const id = parseDocumentId(documentId);
+        const m = await ctx.cache.get(id, true);
+        checkRevision(m, revisionId);
+        const tab = getTab(m, tabId);
+        const tId = tab.tabId;
+
+        if (tab.tables.length === 0) return fail('No tables found in this tab.');
+
+        let targetTable: TableModel | undefined;
+        let resolvedIndex = 0;
+        if (tableStartIndex !== undefined) {
+          targetTable = tab.tables.find((t) => t.startIndex === tableStartIndex);
+          if (!targetTable) return fail(`No table found at tableStartIndex=${tableStartIndex}. Available table start indices: ${tab.tables.map((t) => t.startIndex).join(', ')}`);
+          resolvedIndex = tab.tables.indexOf(targetTable);
+        } else if (tableIndex !== undefined) {
+          if (tableIndex >= tab.tables.length) return fail(`tableIndex ${tableIndex} out of bounds (${tab.tables.length} tables in tab).`);
+          targetTable = tab.tables[tableIndex];
+          resolvedIndex = tableIndex;
+        } else {
+          targetTable = tab.tables[0];
+          resolvedIndex = 0;
+        }
+
+        if (rowIndex >= targetTable.rows) {
+          return fail(`rowIndex ${rowIndex} out of bounds for table with ${targetTable.rows} row(s).`);
+        }
+        if (columnIndex >= targetTable.columns) {
+          return fail(`columnIndex ${columnIndex} out of bounds for table with ${targetTable.columns} column(s).`);
+        }
+
+        const cell = targetTable.cells.find((c) => c.rowIndex === rowIndex && c.columnIndex === columnIndex);
+        if (!cell) {
+          return fail(`Cell at row ${rowIndex}, column ${columnIndex} not found.`);
+        }
+
+        const isStart = position === 'START';
+        let insertIndex: number;
+        let textToInsert = text;
+
+        if (isStart) {
+          insertIndex = cell.startIndex;
+          if (ensureNewline !== false && cell.endIndex > cell.startIndex + 1) {
+            if (!textToInsert.endsWith('\n')) {
+              textToInsert += '\n';
+            }
+          }
+        } else {
+          insertIndex = Math.max(cell.startIndex, cell.endIndex - 1);
+          // Check if preceding character is newline
+          if (ensureNewline !== false && insertIndex > cell.startIndex) {
+            const charBefore = tab.text[insertIndex - 1];
+            if (charBefore !== '\n' && !textToInsert.startsWith('\n')) {
+              textToInsert = '\n' + textToInsert;
+            }
+          }
+        }
+
+        const reqs: DocsRequest[] = [];
+        reqs.push({
+          insertText: {
+            location: { index: insertIndex, ...(tId ? { tabId: tId } : {}) },
+            text: textToInsert,
+          },
+        });
+
+        if (textStyle && hasStyle(textStyle)) {
+          reqs.push(
+            buildUpdateTextStyleRequest(
+              {
+                startIndex: insertIndex,
+                endIndex: insertIndex + textToInsert.length,
+                ...(tId ? { tabId: tId } : {}),
+              },
+              textStyle,
+            ),
+          );
+        }
+
+        const commentReqs: DocsRequest[] = [];
+        if (commentText) {
+          const range: Record<string, unknown> = {
+            startIndex: insertIndex,
+            endIndex: insertIndex + textToInsert.length,
+          };
+          if (tId) range.tabId = tId;
+          commentReqs.push({ insertComment: { range, content: commentText } });
+        }
+
+        const mode = writeMode ?? 'SUGGEST';
+        const wc = writeControlFor(ctx, m, mode);
+        const out =
+          commentReqs.length > 0
+            ? await runContentWithComments(ctx, id, reqs, commentReqs, wc)
+            : await runBatch(ctx, id, reqs, wc);
+
+        return ok({
+          status: 'ok',
+          tableIndex: resolvedIndex,
+          tableStartIndex: targetTable.startIndex,
+          rowIndex,
+          columnIndex,
+          position: isStart ? 'START' : 'END',
+          insertedIndex: insertIndex,
+          insertedLength: textToInsert.length,
+          mode,
+          commentCreated: (out as any).commentsApplied ?? (commentText ? true : undefined),
+          newRevisionId: out.newRevisionId,
+        });
+      },
+    ),
   );
 }

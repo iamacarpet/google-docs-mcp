@@ -223,9 +223,10 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 | Tool | Purpose | Description |
 |---|---|---|
 | `doc_read_document` | Full document read | Reads entire document in token-efficient Markdown with outline hierarchy, section markers, pending suggestions summary, and tables overview. Also supports `format: "raw_json"` for 1:1 parity with Google Workspace MCP `read_doc`. |
-| `doc_read_table` | Dedicated table read | Extracts an individual table formatted as clean GitHub-Flavored Markdown table, a 2D text matrix, or both, with exact cell coordinate bounds. |
+| `doc_read_table` | Dedicated table read | Extracts an individual table formatted as a structured Record view (`format: "record"` - critical for multi-line cells), clean GitHub-Flavored Markdown table (`format: "markdown"`), 2D text matrix, or `all`. Preserves paragraphs, bullets, rich text styling, and tracked changes (`[-deleted-]`/`{+inserted+}`). |
+| `doc_read_table_cell` | Single cell inspection | Reads an individual table cell by `rowIndex` and `columnIndex`. Preserves multi-paragraph layouts, rich styling, and tracked changes, returning `columnHeader`, `safeAppendIndex`, `characterCount`, and `paragraphCount`. |
 | `doc_read_comment_context` | Read around comment | Fetches the targeted sentence and surrounding paragraph(s) for a given `commentId`, wrapping the anchor in `<target>...</target>` tags, with anchor style runs and table context. |
-| `doc_read_range` | Read bounds with Rich Text | Reads text between `startIndex` and `endIndex` (or entire tab if bounds omitted). Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and tables/images in range. |
+| `doc_read_range` | Read bounds with Rich Text | Reads text between `startIndex` and `endIndex` (or entire tab if bounds omitted). Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and `cells` in range. |
 | `doc_inspect_tables` | Inspect tables | Lists all tables in the document (or a specific table) with dimensions, start/end index, and cell matrix (row, column, text, startIndex, endIndex). Supports `includeCellText: false` for low-token structural inspections. |
 
 ### Category C: Safe Mutation, Suggestions & Batch Endpoints
@@ -257,6 +258,7 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 | `doc_format_paragraph` | Headings, Spacing & Lists | Updates paragraph style (`NORMAL_TEXT`, `TITLE`, `HEADING_1`..`HEADING_6`), text alignment, spacing (`spaceAbove`, `spaceBelow`, `lineSpacing`), indentation (`indentStart`, `indentEnd`, `indentFirstLine`), border padding, background shading (`shadingColor`), or creates/removes bullet and numbered lists. |
 | `doc_insert_table` | Insert table | Inserts a table with rows and columns at an index; supports optional `cells: string[][]` initial 2D text matrix to populate cells immediately. |
 | `doc_insert_table_row` | Insert table row | Inserts a new table row ABOVE or BELOW an existing row and optionally populates cell contents with strings in one atomic call. |
+| `doc_append_to_table_cell` | **Safe Cell Append** | Safely appends (or prepends) text to a specific table cell without Google Docs API cell delimiter errors. Supports `SUGGEST` (default) or `EDIT` mode, `textStyle`, and `commentText`. |
 | `doc_modify_table` | Modify table rows/cols | Adds or removes rows or columns in an existing table (`INSERT_ROW_ABOVE`, `INSERT_ROW_BELOW`, `DELETE_ROW`, `INSERT_COLUMN_LEFT`, `INSERT_COLUMN_RIGHT`, `DELETE_COLUMN`). |
 | `doc_insert_image` | Insert image | Inserts an inline image from a publicly accessible HTTPS URI with optional width and height dimensions in points. |
 

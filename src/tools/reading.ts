@@ -558,7 +558,7 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
               annotatedText: annCellText,
               startIndex: cell.startIndex,
               endIndex: cell.endIndex,
-              safeAppendIndex: Math.max(cell.startIndex, cell.endIndex - 1),
+              safeAppendIndex: Math.max(cell.contentStartIndex ?? (cell.startIndex + 1), cell.endIndex - 1),
             });
           } else {
             row.push({ text: '', annotatedText: '', startIndex: 0, endIndex: 0, safeAppendIndex: 0 });
@@ -727,8 +727,8 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
       const mark = markSuggestions !== false;
       const plainText = renderText(tab, cell.startIndex, cell.endIndex, mark).replace(/\x0B/g, '').replace(/\n+$/, '');
       const annotated = renderAnnotatedText(tab, cell.startIndex, cell.endIndex, mark).replace(/\x0B/g, '').replace(/\n+$/, '');
-      const safeAppendIndex = Math.max(cell.startIndex, cell.endIndex - 1);
-      const safePrependIndex = cell.startIndex;
+      const safePrependIndex = cell.contentStartIndex ?? (cell.startIndex + 1);
+      const safeAppendIndex = Math.max(safePrependIndex, cell.endIndex - 1);
       const suggestions = getSuggestionsInRange(tab, cell.startIndex, cell.endIndex);
       const paragraphs = getParagraphsInRange(tab, cell.startIndex, cell.endIndex);
 

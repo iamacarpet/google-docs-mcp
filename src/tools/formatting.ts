@@ -708,20 +708,22 @@ export function registerFormattingTools(server: McpServer, ctx: ToolContext): vo
         }
 
         const isStart = position === 'START';
+        const safePrepend = cell.contentStartIndex ?? (cell.startIndex + 1);
+        const safeAppend = Math.max(safePrepend, cell.endIndex - 1);
         let insertIndex: number;
         let textToInsert = text;
 
         if (isStart) {
-          insertIndex = cell.startIndex;
-          if (ensureNewline !== false && cell.endIndex > cell.startIndex + 1) {
+          insertIndex = safePrepend;
+          if (ensureNewline !== false && cell.endIndex > safePrepend + 1) {
             if (!textToInsert.endsWith('\n')) {
               textToInsert += '\n';
             }
           }
         } else {
-          insertIndex = Math.max(cell.startIndex, cell.endIndex - 1);
+          insertIndex = safeAppend;
           // Check if preceding character is newline
-          if (ensureNewline !== false && insertIndex > cell.startIndex) {
+          if (ensureNewline !== false && insertIndex > safePrepend) {
             const charBefore = tab.text[insertIndex - 1];
             if (charBefore !== '\n' && !textToInsert.startsWith('\n')) {
               textToInsert = '\n' + textToInsert;

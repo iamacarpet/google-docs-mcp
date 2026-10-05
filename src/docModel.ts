@@ -119,6 +119,7 @@ export interface TableCellModel extends IndexRange {
   rowIndex: number;
   columnIndex: number;
   text: string;
+  contentStartIndex?: number;
 }
 
 export interface TableModel extends IndexRange {
@@ -562,12 +563,14 @@ function buildTab(tabId: string, title: string, nestingLevel: number, dt: Raw, i
             const cell = rowCells[cIdx];
             const cellStart = cell.startIndex ?? 0;
             const cellEnd = cell.endIndex ?? cellStart;
+            const contentStart = cell.content?.[0]?.startIndex ?? (cellStart + 1);
             walk(cell.content ?? [], true, { tableIndex: currentTableIndex, rowIndex: rIdx, columnIndex: cIdx });
             cells.push({
               rowIndex: rIdx,
               columnIndex: cIdx,
               startIndex: cellStart,
               endIndex: cellEnd,
+              contentStartIndex: contentStart,
               text: '', // populated below after walk
             });
           }
@@ -919,6 +922,7 @@ export interface TableCellWithContext extends TableCellModel {
   tableStartIndex: number;
   tableEndIndex: number;
   safeAppendIndex: number;
+  safePrependIndex: number;
 }
 
 export function getCellsInRange(tab: TabModel, start: number, end: number): TableCellWithContext[] {
@@ -927,12 +931,15 @@ export function getCellsInRange(tab: TabModel, start: number, end: number): Tabl
     if (table.endIndex <= start || table.startIndex >= end) continue;
     for (const cell of table.cells) {
       if (cell.endIndex > start && cell.startIndex < end) {
+        const safePrepend = cell.contentStartIndex ?? (cell.startIndex + 1);
+        const safeAppend = Math.max(safePrepend, cell.endIndex - 1);
         out.push({
           ...cell,
           tableIndex: table.tableIndex,
           tableStartIndex: table.startIndex,
           tableEndIndex: table.endIndex,
-          safeAppendIndex: Math.max(cell.startIndex, cell.endIndex - 1),
+          safeAppendIndex: safeAppend,
+          safePrependIndex: safePrepend,
         });
       }
     }

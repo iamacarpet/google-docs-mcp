@@ -1,26 +1,31 @@
-# Google Docs Suggestion & Comment MCP Server (`docs-mcp`)
+# Google Docs Editorial & Suggestion MCP Server (`docs-mcp`)
 
-A production-grade Model Context Protocol (MCP) server that runs locally via Node.js, providing native Google Docs comments, comment anchors, suggestion tracking (`writeMode: "SUGGEST"`), rich text formatting, and document elements (tables, layout, images) to AI coding assistants and editorial workflows (Antigravity, Claude, Gemini, Cursor).
+A production-grade Model Context Protocol (MCP) server providing context-efficient Google Docs reading, native comments, anchored review threads, suggestion tracking (`writeMode: "SUGGEST"`), styled redline amendments, rich text formatting, tables, images, and raw Docs REST API parity to AI assistants (Claude, Antigravity, Cursor, Gemini, Windsurf).
 
 ---
 
 ## 1. Overview & Problem Solved
 
-Standard community Google Docs MCP servers convert documents to Markdown or perform direct overwriting edits, destroying native comment anchors and bypassing reviewer change tracking. Meanwhile, raw Docs API integrations dump massive JSON trees (50k–100k+ tokens for medium/large documents) into the LLM context window on every turn.
+Standard community Google Docs MCP servers convert documents to plain Markdown or perform direct overwriting edits, destroying native comment anchors and bypassing reviewer change tracking. Meanwhile, raw Docs API integrations dump massive JSON trees (50k–100k+ tokens for medium/large documents) into the LLM context window on every turn.
 
 Furthermore, traditional plain-text approaches strip all formatting and layout, leaving the AI blind to:
 - **Rich Text Styles:** Bold, italic, underline, strikethrough, font sizes, colors, and links.
 - **Document Elements:** Table structures, cell coordinates, bullet/numbered lists, and embedded images.
+- **Reviewer Suggestions vs. Formatting:** Strikethrough from tracked deletions is indistinguishable from intentional document-level styling.
 
-`docs-mcp` bridges this middleground:
+`docs-mcp` bridges this gap:
 - **Local & Private Execution:** Runs entirely on your local machine using Node.js and standard MCP `stdio` transport. Spawned directly by your MCP client.
 - **In-Memory Cache & Slicer:** Fetches the document DOM once into an in-memory buffer and serves targeted, low-token slices (100–800 tokens each) with exact coordinates.
+- **Dual-Mode Document Reading:** Read targeted ranges or the entire document via `doc_read_document` in token-optimized Markdown (`format: "markdown"`) or raw Docs API AST (`format: "raw_json"` for 1:1 parity with Google Workspace's official `read_doc` tool).
 - **Index-Preserving Rich Text (Read & Write):** Returns both raw plain text (for byte-accurate matching) and Markdown `annotatedText` (with `**bold**`, `*italic*`, `<u>underline</u>`, `~~strikethrough~~`, `[links]`, and `[Image: ...]`), plus structured `runs` mapping exact index ranges to formatting properties.
-- **Table Navigation & Manipulation:** Inspect tables, row/column counts, and cell coordinates with `doc_inspect_tables`. Insert tables, add rows/columns, or delete them with `doc_insert_table` and `doc_modify_table`.
-- **Layout & Image Tools:** Format headings and bullet/numbered lists with `doc_format_paragraph`, and insert images with `doc_insert_image`.
-- **Native Comment & Anchor Highlighting:** Reads and creates native inline comments and comment anchors using the GA Google Docs API v1.
 - **Suggestion Mode by Default:** Revisions default to suggestion mode (`writeControl: { writeMode: "SUGGEST" }`), displaying track changes in the Google Docs web UI.
-- **Reverse-Index Multi-Edits:** Multi-edits are automatically validated, overlap-checked, and applied in descending order of `startIndex` (bottom-to-top), preventing coordinate drift.
+- **Styled Redline Amendments (`doc_suggest_redline_edit`):** Solves the Google Docs API boundary-swallowing bug when formal style guides require retaining original wording (e.g. bold strikethrough) alongside new text (e.g. bold).
+- **Batch Automation & Bulk Management:** Atomic multi-edits (`doc_batch_suggest_edits`), global search & replace (`doc_suggest_replace_all`), and bulk accept/reject of suggestions (`doc_batch_manage_suggestions`).
+- **Docs API REST Parity (`doc_raw_batch_update`):** Direct escape hatch for arbitrary native Google Docs API `batchUpdate` requests in `SUGGEST` or `EDIT` mode (parity with official Google Workspace `update_doc`).
+- **Resilient Unicode Safety Guards:** `expectedText` verification automatically normalizes smart/curly quotes (`“”‘’`), dashes (`—–`), and non-breaking spaces to prevent false-alarm edit aborts.
+- **Table Navigation & Manipulation:** Inspect tables, row/column counts, and cell coordinates with `doc_inspect_tables`. Insert tables (with optional initial cell matrices), add rows/columns, or delete them with `doc_insert_table` and `doc_modify_table`.
+- **Layout & Image Tools:** Format headings, paragraph spacing, border padding, background shading, and bullet/numbered lists with `doc_format_paragraph`, and insert images with `doc_insert_image`.
+- **Native Comment & Anchor Highlighting:** Reads and creates native inline comments and comment anchors using the GA Google Docs API v1.
 
 ---
 
@@ -180,6 +185,22 @@ Add `docs-mcp` to your `claude_desktop_config.json`:
     }
   }
 }
+```
+
+### Connecting to Cursor
+
+In Cursor, go to **Settings > Features > MCP**, click **Add New MCP Server**, and configure:
+- **Name:** `docs-mcp`
+- **Type:** `command`
+- **Command:** `node /ABSOLUTE/PATH/TO/docs-mcp/dist/index.js`
+- **Environment Variables:**
+  - `GOOGLE_CLIENT_ID`: `your-client-id.apps.googleusercontent.com`
+  - `GOOGLE_CLIENT_SECRET`: `GOCSPX-your-client-secret`
+
+### Connecting to Claude Code CLI
+
+```bash
+claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com -e GOOGLE_CLIENT_SECRET=GOCSPX-your-client-secret -- node /ABSOLUTE/PATH/TO/docs-mcp/dist/index.js
 ```
 
 ---

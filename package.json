@@ -2,6 +2,21 @@
   "name": "docs-mcp",
   "version": "0.1.0",
   "description": "Context-efficient Google Docs MCP server with native comment, anchor and suggestion-mode support.",
+  "license": "MIT",
+  "author": "Samuel Melrose <sam@melroseandco.uk>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iamacarpet/google-docs-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-docs",
+    "google-docs-api",
+    "editorial",
+    "suggestions",
+    "comments"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "bin": {

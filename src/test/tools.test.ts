@@ -22,6 +22,14 @@ class MockDocsBackend implements DocsBackend {
     this.rawDoc = createSampleDocument();
   }
 
+  async createDocument(title: string): Promise<docs_v1.Schema$Document> {
+    return {
+      documentId: 'new_created_doc_123',
+      title,
+      revisionId: 'rev_created_1',
+    };
+  }
+
   async getRevisionId(_documentId: string): Promise<string | undefined> {
     return this.rawDoc.revisionId;
   }
@@ -41,6 +49,8 @@ class MockDocsBackend implements DocsBackend {
     this.batchCalls.push({ documentId, requests, writeControl });
     const newRev = `rev_updated_${Date.now()}`;
     this.rawDoc.revisionId = newRev;
+    const acceptedSuggestionIds = requests.filter((r) => r.acceptSuggestion).map((r) => r.acceptSuggestion.suggestionId);
+    const rejectedSuggestionIds = requests.filter((r) => r.rejectSuggestion).map((r) => r.rejectSuggestion.suggestionId);
     return {
       documentId,
       writeControl: {
@@ -50,6 +60,8 @@ class MockDocsBackend implements DocsBackend {
       suggestionResponses: [
         {
           createdSuggestionIds: ['sug_new_1'],
+          ...(acceptedSuggestionIds.length ? { acceptedSuggestionIds } : {}),
+          ...(rejectedSuggestionIds.length ? { rejectedSuggestionIds } : {}),
         },
       ],
       commentUpdateState: 'ALL_SAVED',
@@ -427,5 +439,176 @@ describe('MCP Tools', () => {
     assert.equal(backend.batchCalls[1].writeControl?.writeMode, 'SUGGEST');
     assert.equal(backend.batchCalls[1].requests[0].updateTextStyle.textStyle.bold, true);
     assert.equal(backend.batchCalls[1].requests[0].updateTextStyle.textStyle.strikethrough, true);
+  });
+
+  it('doc_read_document: reads full document in markdown format by default', async () => {
+    const res = await callTool('doc_read_document', {
+      documentId: 'doc_test_123',
+    });
+
+    assert.equal(res.documentId, 'doc_test_123');
+    assert.ok(res.title);
+    assert.ok(res.text && res.text.length > 0);
+    assert.ok(res.annotatedText && res.annotatedText.length > 0);
+    assert.ok(Array.isArray(res.outline));
+    assert.equal(res.startIndex, 1);
+    assert.ok(res.endIndex > 1);
+  });
+
+  it('doc_read_document: returns raw JSON when format: raw_json', async () => {
+    const res = await callTool('doc_read_document', {
+      documentId: 'doc_test_123',
+      format: 'raw_json',
+    });
+
+    assert.equal(res.documentId, 'doc_test_123');
+    assert.ok(res.rawDocument);
+    assert.equal(res.rawDocument.documentId, 'doc_test_123');
+  });
+
+  it('doc_read_range: reads full tab when startIndex and endIndex are omitted', async () => {
+    const res = await callTool('doc_read_range', {
+      documentId: 'doc_test_123',
+    });
+
+    assert.equal(res.startIndex, 1);
+    assert.ok(res.endIndex > 1);
+    assert.ok(res.text && res.text.length > 0);
+  });
+
+  it('expectedText resilience: normalizes unicode quotes and whitespace', async () => {
+    // In sample document, indices 69-89 is "we must move rapidly"
+    // Test that unicode non-breaking space \u00A0 or curly quotes matches standard text
+    const res = await callTool('doc_suggest_edit_range', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      expectedText: 'we\u00A0must move rapidly', // contains non-breaking space
+      suggestedText: 'continue promptly',
+    });
+    assert.equal(res.status, 'ok');
+  });
+
+  it('doc_suggest_redline_edit: inserts new text first and styles retained text second', async () => {
+    const res = await callTool('doc_suggest_redline_edit', {
+      documentId: 'doc_test_123',
+      startIndex: 69,
+      endIndex: 89,
+      replacementText: 'continue promptly',
+      expectedText: 'we must move rapidly',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(backend.batchCalls.length, 1);
+    const call = backend.batchCalls[0];
+    assert.equal(call.writeControl?.writeMode, 'SUGGEST');
+    // First request: insert replacement text at endIndex
+    assert.equal(call.requests[0].insertText.location.index, 89);
+    assert.equal(call.requests[0].insertText.text, 'continue promptly');
+    // Second request: format replacement text with bold: true, strikethrough: false
+    assert.equal(call.requests[1].updateTextStyle.textStyle.bold, true);
+    assert.equal(call.requests[1].updateTextStyle.textStyle.strikethrough, false);
+    // Third request: format retained text with bold: true, strikethrough: true
+    assert.equal(call.requests[2].updateTextStyle.range.startIndex, 69);
+    assert.equal(call.requests[2].updateTextStyle.range.endIndex, 89);
+    assert.equal(call.requests[2].updateTextStyle.textStyle.bold, true);
+    assert.equal(call.requests[2].updateTextStyle.textStyle.strikethrough, true);
+  });
+
+  it('doc_batch_suggest_edits: supports redline items mixed with standard edits', async () => {
+    const res = await callTool('doc_batch_suggest_edits', {
+      documentId: 'doc_test_123',
+      edits: [
+        {
+          startIndex: 69,
+          endIndex: 89,
+          suggestedText: 'continue promptly',
+          redline: true,
+        },
+      ],
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(backend.batchCalls.length, 1);
+    const call = backend.batchCalls[0];
+    assert.equal(call.writeControl?.writeMode, 'SUGGEST');
+    // Request contains redline insertion + styling
+    assert.ok(call.requests.some((r: any) => r.insertText?.text === 'continue promptly'));
+    assert.ok(call.requests.some((r: any) => r.updateTextStyle?.textStyle?.strikethrough === true));
+  });
+
+  it('doc_batch_manage_suggestions: bulk accepts or rejects suggestions', async () => {
+    // Explicit list
+    const resExplicit = await callTool('doc_batch_manage_suggestions', {
+      documentId: 'doc_test_123',
+      action: 'ACCEPT',
+      suggestionIds: ['sug_1', 'sug_2'],
+    });
+    assert.equal(resExplicit.status, 'ok');
+    assert.equal(resExplicit.action, 'ACCEPT');
+    assert.deepEqual(resExplicit.suggestionIds, ['sug_1', 'sug_2']);
+
+    // ACCEPT_ALL across document
+    const resAll = await callTool('doc_batch_manage_suggestions', {
+      documentId: 'doc_test_123',
+      action: 'ACCEPT_ALL',
+    });
+    assert.equal(resAll.status, 'ok');
+    assert.ok(resAll.count > 0);
+  });
+
+  it('doc_suggest_replace_all: proposes search and replace in suggestion mode', async () => {
+    const res = await callTool('doc_suggest_replace_all', {
+      documentId: 'doc_test_123',
+      searchText: 'must',
+      replacementText: 'shall',
+      matchCase: false,
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.ok(res.matchesReplaced > 0);
+    assert.equal(backend.batchCalls[backend.batchCalls.length - 1].writeControl?.writeMode, 'SUGGEST');
+  });
+
+  it('doc_raw_batch_update: executes raw Docs API requests', async () => {
+    const res = await callTool('doc_raw_batch_update', {
+      documentId: 'doc_test_123',
+      requests: [{ insertText: { location: { index: 1 }, text: 'Hello' } }],
+      writeMode: 'EDIT',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.writeMode, 'EDIT');
+    assert.equal(backend.batchCalls[backend.batchCalls.length - 1].writeControl?.writeMode, 'EDIT');
+    assert.equal(backend.batchCalls[backend.batchCalls.length - 1].requests[0].insertText.text, 'Hello');
+  });
+
+  it('doc_create_document: creates new doc with title and initial text', async () => {
+    const res = await callTool('doc_create_document', {
+      title: 'New Research Document',
+      initialText: 'Initial Content\n',
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.documentId, 'new_created_doc_123');
+    assert.equal(res.title, 'New Research Document');
+    assert.ok(res.url.includes('new_created_doc_123'));
+  });
+
+  it('doc_insert_table: supports populating initial cells matrix', async () => {
+    const res = await callTool('doc_insert_table', {
+      documentId: 'doc_test_123',
+      index: 10,
+      rows: 2,
+      columns: 2,
+      cells: [
+        ['Header 1', 'Header 2'],
+        ['Val 1', 'Val 2'],
+      ],
+    });
+
+    assert.equal(res.status, 'ok');
+    assert.equal(res.rows, 2);
+    assert.equal(res.columns, 2);
   });
 });

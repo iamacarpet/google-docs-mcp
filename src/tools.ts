@@ -29,6 +29,8 @@ import {
   type TabModel,
 } from './docModel.js';
 import {
+  DEFAULT_REDLINE_REPLACEMENT_STYLE,
+  DEFAULT_REDLINE_RETAINED_STYLE,
   EditValidationError,
   buildBulletsRequest,
   buildDeleteTableColumnRequest,
@@ -37,14 +39,20 @@ import {
   buildInsertTableColumnRequest,
   buildInsertTableRowRequest,
   buildInsertTableRequest,
+  buildMultiEditRequests,
+  buildMultiRedlineRequests,
+  buildRedlineRequests,
   buildReplaceRequests,
   buildUpdateParagraphStyleRequest,
   buildUpdateTextStyleRequest,
   hasStyle,
+  normalizeExpectedText,
   planRangeEdit,
   sortEditsDescending,
   type DocsRequest,
   type PlannedEdit,
+  type RangeEdit,
+  type RedlineEdit,
   type TextStyleInput,
 } from './edits.js';
 import { DocCache, apiErrorMessage, httpStatus, parseDocumentId, type DocsBackend } from './docsClient.js';
@@ -617,6 +625,149 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'doc_read_document',
+    {
+      title: 'Read whole document',
+      description:
+        'Reads an entire Google Doc (or tab) in one call. By default returns clean, token-efficient Markdown annotatedText plus outline and pending suggestions metadata. For Google Workspace MCP parity, pass format: "raw_json" to retrieve the full, unreduced Google Docs API document structure.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        tabId: tabIdSchema,
+        format: z
+          .enum(['markdown', 'raw_json'])
+          .optional()
+          .default('markdown')
+          .describe('Output format. "markdown" (default) returns token-efficient Markdown + outline. "raw_json" returns full raw Google Docs API JSON structure (parity with official read_doc).'),
+        includeFormatting: z.boolean().optional().describe('Master toggle for rich formatting in markdown mode (default true).'),
+        includeAnnotatedText: z.boolean().optional().describe('Include Markdown annotatedText with formatting (default true).'),
+        includeRuns: z.boolean().optional().describe('Include verbose styled runs array with exact coordinates (default false).'),
+        includeParagraphs: z.boolean().optional().describe('Include verbose paragraph layout/styling objects (default false).'),
+        includeTables: z.boolean().optional().describe('Include table structure and coordinates (default true).'),
+        includeImages: z.boolean().optional().describe('Include inline image metadata (default true).'),
+        markSuggestions: z.boolean().optional().describe('Show pending suggestions as [-deleted-]/{+inserted+} (default true).'),
+        maxCharacters: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .default(50000)
+          .describe('Safety limit on returned character length (default 50,000). If exceeded, truncated: true and nextStartIndex are returned.'),
+      },
+      annotations: RO,
+    },
+    safe(async ({
+      documentId,
+      tabId,
+      format,
+      includeFormatting,
+      includeAnnotatedText,
+      includeRuns,
+      includeParagraphs,
+      includeTables,
+      includeImages,
+      markSuggestions,
+      maxCharacters,
+    }) => {
+      const id = parseDocumentId(documentId);
+      if (format === 'raw_json') {
+        const full = await ctx.backend.fetchFull(id);
+        const m = await load(id);
+        return ok({
+          documentId: id,
+          title: m.title,
+          revisionId: m.revisionId,
+          rawDocument: full.raw,
+        });
+      }
+
+      const m = await load(id);
+      const tab = getTab(m, tabId);
+      const start = 1;
+      const maxChars = maxCharacters ?? 50000;
+      const targetEnd = tab.endIndex;
+      const end = Math.min(targetEnd, start + maxChars);
+      const truncated = end < targetEnd;
+      const mark = markSuggestions !== false;
+      const plainText = renderText(tab, start, end, mark);
+      const pendingSuggestions = getSuggestionsInRange(tab, start, end);
+
+      const formatting = includeFormatting !== false;
+      const res: Record<string, any> = {
+        documentId: id,
+        title: m.title,
+        revisionId: m.revisionId,
+        tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
+        totalCharacters: tab.endIndex,
+        startIndex: start,
+        endIndex: end,
+        text: plainText,
+        hasPendingSuggestions: pendingSuggestions.length > 0,
+        outline: tab.outline.map((h) => ({
+          title: h.title,
+          level: h.level,
+          startIndex: h.startIndex,
+          endIndex: h.endIndex,
+          sectionEndIndex: h.sectionEndIndex,
+        })),
+      };
+      if (pendingSuggestions.length > 0) {
+        res.pendingSuggestionsSummary = {
+          count: pendingSuggestions.length,
+          suggestions: pendingSuggestions.slice(0, 50),
+        };
+      }
+
+      if (formatting) {
+        if (includeAnnotatedText !== false) {
+          res.annotatedText = renderAnnotatedText(tab, start, end, mark);
+        }
+        if (includeRuns === true) {
+          const runs = getRunsInRange(tab, start, end);
+          if (runs.length) res.runs = runs;
+        }
+        if (includeTables !== false) {
+          const tablesInRange = getTablesInRange(tab, start, end);
+          if (tablesInRange.length) {
+            res.tables = tablesInRange.map((t) => ({
+              tableIndex: t.tableIndex,
+              rows: t.rows,
+              columns: t.columns,
+              startIndex: t.startIndex,
+              endIndex: t.endIndex,
+            }));
+          }
+        }
+        if (includeImages !== false) {
+          const imagesInRange = getImagesInRange(tab, start, end);
+          if (imagesInRange.length) res.images = imagesInRange;
+        }
+        if (includeParagraphs === true) {
+          const paragraphsInRange = getParagraphsInRange(tab, start, end);
+          if (paragraphsInRange.length) {
+            res.paragraphs = paragraphsInRange.map((p) => ({
+              startIndex: p.startIndex,
+              endIndex: p.endIndex,
+              namedStyleType: p.namedStyleType,
+              alignment: p.alignment,
+              hasBullet: p.hasBullet,
+              inTable: p.inTable,
+              style: p.style,
+              tableContext: p.tableContext,
+            }));
+          }
+        }
+      }
+
+      if (truncated) {
+        res.truncated = true;
+        res.nextStartIndex = end;
+        res.notice = `Document content truncated at ${maxChars} characters (${end}/${targetEnd}). Use doc_read_range to read subsequent sections.`;
+      }
+      return ok(res);
+    }),
+  );
+
+  server.registerTool(
     'doc_read_range',
     {
       title: 'Read text range',
@@ -628,8 +779,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         '- When pending suggestions exist within the range, they are reported with their exact suggestionId, kind, and bounds in pendingSuggestions.',
       inputSchema: {
         documentId: documentIdSchema,
-        startIndex: indexSchema,
-        endIndex: indexSchema,
+        startIndex: indexSchema.optional().describe('Start index (inclusive). Defaults to 1 (beginning of body).'),
+        endIndex: indexSchema.optional().describe('End index (exclusive). Defaults to end of tab body.'),
         tabId: tabIdSchema,
         includeFormatting: z.boolean().optional().describe('Master toggle for rich formatting. If false, returns raw plain text only (default true).'),
         includeAnnotatedText: z.boolean().optional().describe('Include Markdown annotatedText with **bold**, *italic*, <u>underline</u>, ~~strike~~, and links. Very low token cost (default true when formatting is enabled).'),
@@ -656,19 +807,21 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
-      if (endIndex < startIndex) return fail('endIndex must be >= startIndex.');
-      if (startIndex >= tab.endIndex) return fail(`startIndex ${startIndex} is beyond the end of the tab (${tab.endIndex}).`);
-      const end = Math.min(endIndex, tab.endIndex, startIndex + MAX_READ_CHARS);
-      const truncated = end < Math.min(endIndex, tab.endIndex);
+      const start = startIndex ?? 1;
+      const targetEnd = endIndex ?? tab.endIndex;
+      if (targetEnd < start) return fail('endIndex must be >= startIndex.');
+      if (start >= tab.endIndex && tab.endIndex > 1) return fail(`startIndex ${start} is beyond the end of the tab (${tab.endIndex}).`);
+      const end = Math.min(targetEnd, tab.endIndex, start + MAX_READ_CHARS);
+      const truncated = end < Math.min(targetEnd, tab.endIndex);
       const mark = markSuggestions !== false;
-      const plainText = renderText(tab, startIndex, end, mark);
-      const pendingSuggestions = getSuggestionsInRange(tab, startIndex, end);
+      const plainText = renderText(tab, start, end, mark);
+      const pendingSuggestions = getSuggestionsInRange(tab, start, end);
 
       const formatting = includeFormatting !== false;
       const res: Record<string, any> = {
         revisionId: m.revisionId,
         tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
-        startIndex,
+        startIndex: start,
         endIndex: end,
         text: plainText,
         hasPendingSuggestions: pendingSuggestions.length > 0,
@@ -679,16 +832,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
       if (formatting) {
         if (includeAnnotatedText !== false) {
-          res.annotatedText = renderAnnotatedText(tab, startIndex, end, mark);
+          res.annotatedText = renderAnnotatedText(tab, start, end, mark);
         }
         if (includeRuns === true) {
-          const runs = getRunsInRange(tab, startIndex, end);
+          const runs = getRunsInRange(tab, start, end);
           if (runs.length) res.runs = runs;
         }
-        const tblContext = getTableContext(tab, startIndex);
+        const tblContext = getTableContext(tab, start);
         if (tblContext) res.tableContext = tblContext;
         if (includeTables !== false) {
-          const tablesInRange = getTablesInRange(tab, startIndex, end);
+          const tablesInRange = getTablesInRange(tab, start, end);
           if (tablesInRange.length) {
             res.tables = tablesInRange.map((t) => ({
               tableIndex: t.tableIndex,
@@ -700,11 +853,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           }
         }
         if (includeImages !== false) {
-          const imagesInRange = getImagesInRange(tab, startIndex, end);
+          const imagesInRange = getImagesInRange(tab, start, end);
           if (imagesInRange.length) res.images = imagesInRange;
         }
         if (includeParagraphs === true) {
-          const paragraphsInRange = getParagraphsInRange(tab, startIndex, end);
+          const paragraphsInRange = getParagraphsInRange(tab, start, end);
           if (paragraphsInRange.length) {
             res.paragraphs = paragraphsInRange.map((p) => ({
               startIndex: p.startIndex,
@@ -902,16 +1055,98 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'doc_suggest_redline_edit',
+    {
+      title: 'Suggest redline / styled amendment',
+      description:
+        'Submits a redline revision (tracked change) where original text is RETAINED with custom formatting ' +
+        '(e.g. bold strikethrough, italic strikethrough) rather than deleted, and optional replacement text is inserted alongside it with custom formatting (e.g. bold, italic, color).\n\n' +
+        'HOW IT WORKS:\n' +
+        '- Retained deletion: formats original [startIndex, endIndex) with retainedStyle (default: bold + strikethrough).\n' +
+        '- Addition: inserts replacementText with replacementStyle (default: bold, strikethrough: false).\n' +
+        '- Pure deletion (no replacement text): omit replacementText; original text is retained and marked with retainedStyle.\n' +
+        '- Pure insertion: set startIndex === endIndex with replacementText and replacementStyle.\n' +
+        '- Solves the Google Docs boundary-swallowing bug by automatically placing and styling the inserted text first and original text second in one atomic batch.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        startIndex: indexSchema,
+        endIndex: indexSchema,
+        expectedText: expectedTextSchema,
+        replacementText: z.string().optional().describe('New wording to insert. If omitted, original text is retained and marked with retainedStyle without replacement.'),
+        retainedStyle: textStyleSchema.describe('Styling for retained original text (default: { bold: true, strikethrough: true }). Set italic, color, etc. to match any party/stage guide.'),
+        replacementStyle: textStyleSchema.describe('Styling for inserted replacement text (default: { bold: true, strikethrough: false }). Set italic, underline, color, etc.'),
+        insertionPosition: z.enum(['AFTER', 'BEFORE']).optional().default('AFTER').describe('Whether replacement text appears AFTER original text (default) or BEFORE it.'),
+        revisionId: revisionIdSchema,
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({
+      documentId,
+      startIndex,
+      endIndex,
+      expectedText,
+      replacementText,
+      retainedStyle,
+      replacementStyle,
+      insertionPosition,
+      revisionId,
+      tabId,
+    }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      checkRevision(m, revisionId);
+      const tab = getTab(m, tabId);
+
+      const originalText = tab.text.slice(startIndex, endIndex);
+      if (expectedText !== undefined && originalText !== expectedText) {
+        if (normalizeExpectedText(originalText) !== normalizeExpectedText(expectedText)) {
+          throw new EditValidationError(
+            `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
+              truncate(originalText, 300),
+            )}. The document may have changed; re-read the range or re-run doc_search_text to get fresh indices.`,
+          );
+        }
+      }
+
+      const reqs = buildRedlineRequests(tab, {
+        startIndex,
+        endIndex,
+        replacementText,
+        retainedStyle,
+        replacementStyle,
+        insertionPosition,
+      });
+
+      const wc = writeControlFor(ctx, m, 'SUGGEST');
+      const out = await runBatch(ctx, id, reqs, wc);
+      return ok({
+        status: 'ok',
+        documentId: id,
+        newRevisionId: out.newRevisionId,
+        createdSuggestionIds: suggestionIdsFrom(out.response, 'createdSuggestionIds'),
+        notes: [
+          `Applied redline amendment at [${startIndex}, ${endIndex}): retained original text styled with ` +
+            JSON.stringify(retainedStyle ?? DEFAULT_REDLINE_RETAINED_STYLE) +
+            (replacementText
+              ? ` and inserted new text styled with ${JSON.stringify(replacementStyle ?? DEFAULT_REDLINE_REPLACEMENT_STYLE)}`
+              : ''),
+        ],
+      });
+    }),
+  );
+
+  server.registerTool(
     'doc_batch_suggest_edits',
     {
       title: 'Batch suggest edits',
       description:
-        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId or an explicit [startIndex, endIndex) range, with optional textStyle. The server sorts edits bottom-to-top so indices never drift.\n\n' +
+        'Submits several suggested revisions in ONE batchUpdate (suggestion mode). Each item targets either a commentId or an explicit [startIndex, endIndex) range, with optional textStyle or redline formatting. The server sorts edits bottom-to-top so indices never drift.\n\n' +
         'USAGE PATTERNS:\n' +
         '- Pure insertion: set startIndex === endIndex with suggestedText and optional textStyle (e.g. bold: true).\n' +
         '- Deletion: set suggestedText: "" to suggest deleting the target range.\n' +
         '- Replacement: provide target range and suggestedText.\n' +
-        '- NOTE ON STYLE-GUIDE AMENDMENTS: If your style guide requires retaining original wording as bold strikethrough, insert the new text FIRST as bold with startIndex === endIndex and strikethrough: false, then format the original text SECOND with bold strikethrough.',
+        '- Redline / styled amendment: set redline: true with retainedStyle (default bold strikethrough) and replacementStyle (default bold) to keep original text formatted in the doc alongside new text.',
       inputSchema: {
         documentId: documentIdSchema,
         edits: z
@@ -925,6 +1160,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 .string()
                 .describe('Replacement text. Pass empty string "" to suggest deleting the target text. For pure insertion, set startIndex equal to endIndex.'),
               textStyle: textStyleSchema.describe('Styling applied to the NEW replacement text (e.g. bold: true). Does not affect deleted text.'),
+              redline: z
+                .boolean()
+                .optional()
+                .describe('If true, performs a styled redline amendment: original text is retained with retainedStyle (default bold strikethrough), and suggestedText is inserted with replacementStyle or textStyle (default bold).'),
+              retainedStyle: textStyleSchema.describe('Style for retained original text when redline is true (default: bold strikethrough).'),
+              replacementStyle: textStyleSchema.describe('Style for inserted replacement text when redline is true (defaults to textStyle or bold).'),
             }),
           )
           .min(1)
@@ -939,7 +1180,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const id = parseDocumentId(documentId);
       const m = await ctx.cache.get(id, true);
       let tab: TabModel | undefined;
-      const planned: (PlannedEdit & { item: number; commentId?: string })[] = [];
+      const planned: (PlannedEdit & {
+        item: number;
+        commentId?: string;
+        isRedline?: boolean;
+        retainedStyle?: TextStyleInput;
+        replacementStyle?: TextStyleInput;
+      })[] = [];
       edits.forEach((e, item) => {
         let t: TabModel;
         let range: IndexRange;
@@ -957,18 +1204,23 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (tab && t !== tab) throw new EditValidationError('All edits in one batch must target the same document tab.');
         tab = t;
         try {
+          const isRedline = !!(e.redline || e.retainedStyle || e.replacementStyle);
+          const plan = planRangeEdit(
+            t,
+            {
+              ...range,
+              text: e.suggestedText,
+              textStyle: e.textStyle,
+            },
+            e.expectedText,
+          );
           planned.push({
-            ...planRangeEdit(
-              t,
-              {
-                ...range,
-                text: e.suggestedText,
-                textStyle: e.textStyle,
-              },
-              e.expectedText,
-            ),
+            ...plan,
             item,
             commentId: e.commentId,
+            isRedline,
+            retainedStyle: e.retainedStyle,
+            replacementStyle: e.replacementStyle,
           });
         } catch (err) {
           if (err instanceof EditValidationError) throw new EditValidationError(`edits[${item}]: ${err.message}`);
@@ -976,7 +1228,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         }
       });
       const ordered = sortEditsDescending(planned);
-      const contentReqs = ordered.flatMap((p) => buildReplaceRequests(tab!, p));
+      const contentReqs = ordered.flatMap((p) => {
+        if (p.isRedline) {
+          return buildRedlineRequests(tab!, {
+            startIndex: p.startIndex,
+            endIndex: p.endIndex,
+            replacementText: p.text,
+            retainedStyle: p.retainedStyle,
+            replacementStyle: p.replacementStyle ?? p.textStyle,
+          });
+        }
+        return buildReplaceRequests(tab!, p);
+      });
       const resolve = resolveComments !== false;
       const commentIds = [...new Set(ordered.filter((p) => p.commentId).map((p) => p.commentId!))];
       const commentReqs = resolve
@@ -995,6 +1258,234 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         atomic: out.atomic,
         newRevisionId: out.newRevisionId,
         warnings: [...notes, ...out.warnings].length ? [...notes, ...out.warnings] : undefined,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_batch_manage_suggestions',
+    {
+      title: 'Batch accept or reject suggestions',
+      description:
+        'Accepts or rejects multiple pending suggestions in ONE atomic batchUpdate. Can accept/reject an explicit list of suggestionIds or ACCEPT_ALL / REJECT_ALL across the document.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        action: z.enum(['ACCEPT', 'REJECT', 'ACCEPT_ALL', 'REJECT_ALL']).describe('Batch action to perform.'),
+        suggestionIds: z
+          .array(z.string().min(1))
+          .optional()
+          .describe('List of suggestionIds to accept or reject. Required for ACCEPT / REJECT; omitted or ignored for ACCEPT_ALL / REJECT_ALL.'),
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    safe(async ({ documentId, action, suggestionIds, tabId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      let targetIds: string[] = [];
+
+      if (action === 'ACCEPT_ALL' || action === 'REJECT_ALL') {
+        const tabs = tabId ? [getTab(m, tabId)] : m.tabs;
+        const set = new Set<string>();
+        for (const tab of tabs) {
+          for (const [sid] of tab.suggestionSpans) set.add(sid);
+        }
+        for (const th of m.suggestionThreads) {
+          if (th.status !== 'ACCEPTED' && th.status !== 'REJECTED') set.add(th.suggestionId);
+        }
+        targetIds = [...set];
+        if (targetIds.length === 0) {
+          return ok({ status: 'ok', action, message: 'No pending suggestions to process.', count: 0 });
+        }
+      } else {
+        if (!suggestionIds || suggestionIds.length === 0) {
+          return fail('suggestionIds array is required when action is ACCEPT or REJECT.');
+        }
+        targetIds = suggestionIds;
+      }
+
+      const isAccept = action === 'ACCEPT' || action === 'ACCEPT_ALL';
+      const requests = targetIds.map((sid) =>
+        isAccept ? { acceptSuggestion: { suggestionId: sid } } : { rejectSuggestion: { suggestionId: sid } },
+      );
+
+      const out = await runBatch(ctx, id, requests);
+      return ok({
+        status: 'ok',
+        action,
+        count: targetIds.length,
+        suggestionIds: targetIds,
+        accepted: suggestionIdsFrom(out.response, 'acceptedSuggestionIds'),
+        rejected: suggestionIdsFrom(out.response, 'rejectedSuggestionIds'),
+        newRevisionId: out.newRevisionId,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_suggest_replace_all',
+    {
+      title: 'Suggest search and replace all',
+      description:
+        'Finds all occurrences of searchText and proposes replacements across the document in ONE atomic batchUpdate in SUGGEST mode. Supports standard tracked replacements (native deletion + insertion) or redline mode (original retained as bold strikethrough, new text inserted as bold).',
+      inputSchema: {
+        documentId: documentIdSchema,
+        searchText: z.string().min(1).describe('The exact text string to search for and replace.'),
+        replacementText: z.string().describe('The new replacement text.'),
+        matchCase: z.boolean().optional().default(true).describe('Case-sensitive matching (default true).'),
+        redline: z.boolean().optional().default(false).describe('If true, retains original matches formatted as bold strikethrough and inserts replacementText as bold. If false (default), proposes native tracked deletion + replacement.'),
+        retainedStyle: textStyleSchema.describe('Style for retained original text when redline is true (default: bold strikethrough).'),
+        replacementStyle: textStyleSchema.describe('Style for inserted replacement text (default: bold, strikethrough: false).'),
+        textStyle: textStyleSchema.describe('Styling for the replacement text in standard mode.'),
+        tabId: tabIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({
+      documentId,
+      searchText: target,
+      replacementText,
+      matchCase,
+      redline,
+      retainedStyle,
+      replacementStyle,
+      textStyle,
+      tabId,
+    }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      const tab = getTab(m, tabId);
+      const isCase = matchCase !== false;
+
+      const matches: { startIndex: number; endIndex: number }[] = [];
+      const text = tab.text;
+      const needle = isCase ? target : target.toLowerCase();
+      const haystack = isCase ? text : text.toLowerCase();
+      let pos = 0;
+      while ((pos = haystack.indexOf(needle, pos)) !== -1) {
+        const start = pos;
+        const end = pos + target.length;
+        if (!text.slice(start, end).includes(GAP)) {
+          matches.push({ startIndex: start, endIndex: end });
+        }
+        pos = end;
+      }
+
+      if (matches.length === 0) {
+        return ok({
+          status: 'ok',
+          matchesFound: 0,
+          message: `No occurrences of ${JSON.stringify(target)} found in tab.`,
+        });
+      }
+
+      const sortedMatches = [...matches].sort((a, b) => b.startIndex - a.startIndex);
+
+      let requests: DocsRequest[] = [];
+      if (redline) {
+        const redlines: RedlineEdit[] = sortedMatches.map((m) => ({
+          startIndex: m.startIndex,
+          endIndex: m.endIndex,
+          replacementText,
+          retainedStyle: retainedStyle ?? DEFAULT_REDLINE_RETAINED_STYLE,
+          replacementStyle: replacementStyle ?? textStyle ?? DEFAULT_REDLINE_REPLACEMENT_STYLE,
+        }));
+        requests = buildMultiRedlineRequests(tab, redlines);
+      } else {
+        const edits: RangeEdit[] = sortedMatches.map((m) => ({
+          startIndex: m.startIndex,
+          endIndex: m.endIndex,
+          text: replacementText,
+          textStyle,
+        }));
+        requests = buildMultiEditRequests(tab, edits);
+      }
+
+      const wc = writeControlFor(ctx, m, 'SUGGEST');
+      const out = await runBatch(ctx, id, requests, wc);
+      return ok({
+        status: 'ok',
+        matchesReplaced: matches.length,
+        ranges: matches,
+        mode: redline ? 'redline' : 'native_suggestion',
+        newRevisionId: out.newRevisionId,
+        createdSuggestionIds: suggestionIdsFrom(out.response, 'createdSuggestionIds'),
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_raw_batch_update',
+    {
+      title: 'Raw Docs API batchUpdate (Escape Hatch)',
+      description:
+        'Direct passthrough to the Google Docs API documents.batchUpdate endpoint (parity with Google Workspace MCP update_doc). ' +
+        'Allows executing ANY native Google Docs REST API requests (e.g. insertText, updateTextStyle, replaceAllText, updateDocumentStyle, deleteContentRange, createNamedRange). ' +
+        'By default runs with writeMode: "SUGGEST" (tracked suggestion mode), or pass writeMode: "EDIT" for direct modification.',
+      inputSchema: {
+        documentId: documentIdSchema,
+        requests: z.array(z.record(z.any())).min(1).describe('Array of raw Google Docs REST API Request objects.'),
+        writeMode: z
+          .enum(['SUGGEST', 'EDIT'])
+          .optional()
+          .default('SUGGEST')
+          .describe('Whether changes are submitted as suggestions (SUGGEST, default) or applied directly (EDIT).'),
+        targetRevisionId: revisionIdSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ documentId, requests, writeMode, targetRevisionId }) => {
+      const id = parseDocumentId(documentId);
+      const m = await ctx.cache.get(id, true);
+      checkRevision(m, targetRevisionId);
+      const wc: docs_v1.Schema$WriteControl = {};
+      if (writeMode === 'EDIT') wc.writeMode = 'EDIT';
+      else wc.writeMode = 'SUGGEST';
+      if (ctx.requireRevision && m.revisionId) wc.requiredRevisionId = m.revisionId;
+
+      const out = await runBatch(ctx, id, requests as DocsRequest[], wc);
+      return ok({
+        status: 'ok',
+        writeMode: writeMode ?? 'SUGGEST',
+        newRevisionId: out.newRevisionId,
+        response: out.response,
+      });
+    }),
+  );
+
+  server.registerTool(
+    'doc_create_document',
+    {
+      title: 'Create new Google Doc',
+      description:
+        'Creates a new blank Google Document in Google Drive with the given title, and optionally inserts initial text content.',
+      inputSchema: {
+        title: z.string().min(1).describe('The title for the new Google Document.'),
+        initialText: z.string().optional().describe('Optional initial text to insert into the document body upon creation.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    safe(async ({ title, initialText }) => {
+      if (!ctx.backend.createDocument) {
+        return fail('createDocument is not supported by the current backend.');
+      }
+      const created = await ctx.backend.createDocument(title);
+      const docId = created.documentId;
+      if (!docId) return fail('Failed to obtain documentId from Google Docs API.');
+
+      let revisionId = created.revisionId;
+      if (initialText && initialText.length > 0) {
+        const req = { insertText: { location: { index: 1 }, text: initialText } };
+        const out = await runBatch(ctx, docId, [req], { writeMode: 'EDIT' });
+        revisionId = out.newRevisionId;
+      }
+
+      return ok({
+        status: 'ok',
+        documentId: docId,
+        title: created.title ?? title,
+        revisionId,
+        url: `https://docs.google.com/document/d/${docId}/edit`,
       });
     }),
   );
@@ -1070,11 +1561,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (expectedText !== undefined) {
           const actual = tab.text.slice(startIndex, endIndex);
           if (actual !== expectedText) {
-            return fail(
-              `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
-                truncate(actual, 300),
-              )}.`,
-            );
+            if (normalizeExpectedText(actual) !== normalizeExpectedText(expectedText)) {
+              return fail(
+                `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
+                  truncate(actual, 300),
+                )}.`,
+              );
+            }
           }
         }
         const explicitStyle: TextStyleInput = { ...textStyle };
@@ -1373,12 +1866,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         index: indexSchema.describe('Document model index to insert the table at.'),
         rows: z.number().int().min(1).max(100).describe('Number of rows.'),
         columns: z.number().int().min(1).max(50).describe('Number of columns.'),
+        cells: z
+          .array(z.array(z.string()))
+          .optional()
+          .describe('Optional initial 2D cell text matrix [rows][columns] to populate into the new table. Avoids needing separate insert calls for each cell.'),
         tabId: tabIdSchema,
         revisionId: revisionIdSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    safe(async ({ documentId, index, rows, columns, tabId, revisionId }) => {
+    safe(async ({ documentId, index, rows, columns, cells, tabId, revisionId }) => {
       const id = parseDocumentId(documentId);
       const m = await ctx.cache.get(id, true);
       checkRevision(m, revisionId);
@@ -1387,6 +1884,46 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       if (tab.text[index] === GAP) return fail(`Cannot insert table at index ${index}: it is a structural marker.`);
       const req = buildInsertTableRequest({ index, ...(tab.tabId ? { tabId: tab.tabId } : {}) }, rows, columns);
       const out = await runBatch(ctx, id, [req], writeControlFor(ctx, m, 'EDIT'));
+
+      if (cells && cells.length > 0) {
+        const freshModel = await ctx.cache.get(id, true);
+        const freshTab = getTab(freshModel, tabId);
+        const insertedTable = freshTab.tables.find((t) => t.startIndex >= index) ?? freshTab.tables[freshTab.tables.length - 1];
+        if (insertedTable) {
+          const populateReqs: DocsRequest[] = [];
+          const tId = freshTab.tabId;
+          const numRows = Math.min(rows, cells.length);
+          for (let r = numRows - 1; r >= 0; r--) {
+            const rowCells = cells[r] ?? [];
+            const numCols = Math.min(columns, rowCells.length);
+            for (let c = numCols - 1; c >= 0; c--) {
+              const text = rowCells[c];
+              if (!text) continue;
+              const targetCell = insertedTable.cells.find((cell) => cell.rowIndex === r && cell.columnIndex === c);
+              if (targetCell) {
+                populateReqs.push({
+                  insertText: {
+                    location: { index: targetCell.startIndex, ...(tId ? { tabId: tId } : {}) },
+                    text,
+                  },
+                });
+              }
+            }
+          }
+          if (populateReqs.length > 0) {
+            const popOut = await runBatch(ctx, id, populateReqs, writeControlFor(ctx, freshModel, 'EDIT'));
+            return ok({
+              status: 'ok',
+              index,
+              rows,
+              columns,
+              cellsPopulated: populateReqs.length,
+              newRevisionId: popOut.newRevisionId,
+            });
+          }
+        }
+      }
+
       return ok({
         status: 'ok',
         index,

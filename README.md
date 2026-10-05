@@ -196,26 +196,33 @@ Add `docs-mcp` to your `claude_desktop_config.json`:
 | `doc_search_text` | Find text | Finds occurrences of terms/phrases across the document buffer without dumping content into context; returns exact `startIndex`/`endIndex` and snippet preview. |
 | `doc_list_suggestions` | Tracked changes | Lists pending suggestions (insertions, deletions, text styles) with `suggestionId`, type, author, summary, and preview. |
 
-### Category B: Targeted Context Reading
+### Category B: Reading & Context Inspection
 
 | Tool | Purpose | Description |
 |---|---|---|
+| `doc_read_document` | Full document read | Reads entire document in token-efficient Markdown with outline hierarchy, section markers, pending suggestions summary, and tables overview. Also supports `format: "raw_json"` for 1:1 parity with Google Workspace MCP `read_doc`. |
 | `doc_read_comment_context` | Read around comment | Fetches the targeted sentence and surrounding paragraph(s) for a given `commentId`, wrapping the anchor in `<target>...</target>` tags, with anchor style runs and table context. |
-| `doc_read_range` | Read bounds with Rich Text | Reads text strictly between `startIndex` and `endIndex`. Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and tables/images in range. |
-| `doc_inspect_tables` | Inspect tables | Lists all tables in the document (or a specific table) with dimensions, start/end index, and cell matrix (row, column, text, startIndex, endIndex). |
+| `doc_read_range` | Read bounds with Rich Text | Reads text between `startIndex` and `endIndex` (or entire tab if bounds omitted). Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and tables/images in range. |
+| `doc_inspect_tables` | Inspect tables | Lists all tables in the document (or a specific table) with dimensions, start/end index, and cell matrix (row, column, text, startIndex, endIndex). Supports `includeCellText: false` for low-token structural inspections. |
 
-### Category C: Safe Mutation & Suggestions
+### Category C: Safe Mutation, Suggestions & Batch Endpoints
 
 | Tool | Purpose | Description |
 |---|---|---|
-| `doc_suggest_comment_revision` | **Core Review Automation** | Atomically replaces the anchored text of a comment with suggested wording in suggestion mode (`writeMode: "SUGGEST"`), supports `textStyle`, and resolves the comment thread in a single `batchUpdate`. |
-| `doc_suggest_edit_range` | Propose revision | Submits a suggested revision between `startIndex` and `endIndex`. Supports optional `textStyle` (bold, italic, colors, etc.). |
+| `doc_suggest_comment_revision` | **Review Automation** | Atomically replaces the anchored text of a comment with suggested wording in suggestion mode (`writeMode: "SUGGEST"`), supports `textStyle`, and resolves the comment thread in a single `batchUpdate`. |
+| `doc_suggest_deletion` | Tracked deletion | Submits a native tracked deletion suggestion. Text is removed when accepted (Google Docs renders this with strikethrough in its web UI). |
+| `doc_suggest_edit_range` | Propose revision | Submits a suggested revision between `startIndex` and `endIndex` (or pure insertion if `startIndex === endIndex`). Supports optional `textStyle` on inserted text. |
+| `doc_suggest_redline_edit` | **Styled Redline Amendment** | Solves the Docs API boundary-swallowing bug for formal style guides: retains original text with custom formatting (e.g. bold strikethrough) and inserts replacement text alongside it (e.g. bold), without deleting original wording. |
+| `doc_suggest_replace_all` | Search & replace all | Finds all occurrences of text and proposes tracked replacements across the document in ONE atomic call. Supports both standard replacements and redline mode. |
+| `doc_batch_suggest_edits` | Batch revisions | Submits multiple suggested revisions in one atomic `batchUpdate`. Supports `textStyle`, deletions, pure insertions, and `redline: true` per item. Automatically orders edits bottom-to-top and rejects overlaps. |
+| `doc_batch_manage_suggestions` | Bulk accept/reject | Atomically accepts or rejects multiple suggestions at once by ID or with `action: "ACCEPT_ALL"` / `"REJECT_ALL"`. |
 | `doc_apply_direct_edit` | Direct overwrite | Overwrites `[startIndex, endIndex)` directly (`writeMode: "EDIT"`). Supports optional `textStyle`. |
-| `doc_batch_suggest_edits` | Batch revisions | Submits multiple suggested revisions in one `batchUpdate`. Supports `textStyle` per item. Automatically orders edits bottom-to-top and rejects overlaps. |
+| `doc_raw_batch_update` | **Docs API Escape Hatch** | Direct passthrough to Docs API `batchUpdate` (1:1 parity with Google Workspace MCP `update_doc`). Executes arbitrary native Docs requests with `writeMode: "SUGGEST"` or `"EDIT"`. |
+| `doc_create_document` | Create new document | Creates a new blank Google Document in Google Drive with an optional initial text body. |
 | `doc_add_comment` | Create comment | Creates a new inline comment anchored directly over the specified text span `[startIndex, endIndex)`. |
 | `doc_reply_comment` | Reply to thread | Adds a reply to a comment thread without editing document text; optionally `RESOLVE`s or `REOPEN`s the thread. |
 | `doc_delete_comment` | Delete comment | Permanently deletes a comment thread or reply post. |
-| `doc_manage_suggestion` | Accept/reject | Programmatically accepts or rejects a pending suggestion by `suggestionId`. |
+| `doc_manage_suggestion` | Accept/reject single | Programmatically accepts or rejects a single pending suggestion by `suggestionId`. |
 
 ### Category D: Rich Formatting & Layout
 
@@ -223,7 +230,7 @@ Add `docs-mcp` to your `claude_desktop_config.json`:
 |---|---|---|
 | `doc_format_text` | Style text | Formats any text range with bold, italic, underline, strikethrough, fontSize, colors, links. Runs in `SUGGEST` or `EDIT` mode. |
 | `doc_format_paragraph` | Headings, Spacing & Lists | Updates paragraph style (`NORMAL_TEXT`, `TITLE`, `HEADING_1`..`HEADING_6`), text alignment, spacing (`spaceAbove`, `spaceBelow`, `lineSpacing`), indentation (`indentStart`, `indentEnd`, `indentFirstLine`), border padding, background shading (`shadingColor`), or creates/removes bullet and numbered lists. |
-| `doc_insert_table` | Insert table | Inserts a table with the specified number of rows and columns at an index. |
+| `doc_insert_table` | Insert table | Inserts a table with rows and columns at an index; supports optional `cells: string[][]` initial 2D text matrix to populate cells immediately. |
 | `doc_modify_table` | Modify table rows/cols | Adds or removes rows or columns in an existing table (`INSERT_ROW_ABOVE`, `INSERT_ROW_BELOW`, `DELETE_ROW`, `INSERT_COLUMN_LEFT`, `INSERT_COLUMN_RIGHT`, `DELETE_COLUMN`). |
 | `doc_insert_image` | Insert image | Inserts an inline image from a publicly accessible HTTPS URI with optional width and height dimensions in points. |
 

@@ -106,6 +106,14 @@ function isLowSurrogate(code: number): boolean {
   return code >= 0xdc00 && code <= 0xdfff;
 }
 
+export function normalizeExpectedText(text: string): string {
+  return text
+    .replace(/[\u201C\u201D\u201E\u201F\u00AB\u00BB]/g, '"')
+    .replace(/[\u2018\u2019\u201A\u201B\u02BC\u02BB]/g, "'")
+    .replace(/[\u00A0\u2000-\u200B\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u2013\u2014\u2212]/g, '-');
+}
+
 /**
  * Validates a single range edit against the tab buffer and normalises it.
  * Throws EditValidationError with an actionable message on failure.
@@ -124,11 +132,15 @@ export function planRangeEdit(tab: TabModel, edit: RangeEdit, expectedText?: str
 
   const originalText = tab.text.slice(startIndex, endIndex);
   if (expectedText !== undefined && originalText !== expectedText) {
-    throw new EditValidationError(
-      `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
-        truncate(originalText, 300),
-      )}. The document may have changed; re-read the range or re-run doc_search_text to get fresh indices.`,
-    );
+    if (normalizeExpectedText(originalText) === normalizeExpectedText(expectedText)) {
+      notes.push('expectedText matched current document text after normalizing unicode quotes/whitespace/dashes.');
+    } else {
+      throw new EditValidationError(
+        `Text at [${startIndex}, ${endIndex}) does not match expectedText. Current text: ${JSON.stringify(
+          truncate(originalText, 300),
+        )}. The document may have changed; re-read the range or re-run doc_search_text to get fresh indices.`,
+      );
+    }
   }
 
   // The final newline of the body can never be deleted.
@@ -552,3 +564,87 @@ export function buildReplaceRequests(tab: TabModel, edit: RangeEdit): DocsReques
 export function buildMultiEditRequests(tab: TabModel, edits: RangeEdit[]): DocsRequest[] {
   return sortEditsDescending(edits).flatMap((e) => buildReplaceRequests(tab, e));
 }
+
+export interface RedlineEdit extends IndexRange {
+  expectedText?: string;
+  replacementText?: string;
+  retainedStyle?: TextStyleInput;
+  replacementStyle?: TextStyleInput;
+  insertionPosition?: 'AFTER' | 'BEFORE';
+}
+
+export const DEFAULT_REDLINE_RETAINED_STYLE: TextStyleInput = { bold: true, strikethrough: true };
+export const DEFAULT_REDLINE_REPLACEMENT_STYLE: TextStyleInput = { bold: true, strikethrough: false };
+
+/**
+ * Builds Docs API requests for a redline amendment:
+ * - Retained text in [startIndex, endIndex) is kept in the document and styled with retainedStyle
+ * - Replacement text is inserted alongside it with replacementStyle (strikethrough explicitly false)
+ * - Safe sequencing: inserted text is placed and styled FIRST so Docs API never expands the
+ *   retained text's strikethrough to cover the newly inserted text.
+ */
+export function buildRedlineRequests(tab: TabModel, edit: RedlineEdit): DocsRequest[] {
+  const {
+    startIndex,
+    endIndex,
+    replacementText,
+    retainedStyle = DEFAULT_REDLINE_RETAINED_STYLE,
+    replacementStyle = DEFAULT_REDLINE_REPLACEMENT_STYLE,
+    insertionPosition = 'AFTER',
+  } = edit;
+  const reqs: DocsRequest[] = [];
+
+  const effReplacementStyle: TextStyleInput = {
+    ...replacementStyle,
+    strikethrough: replacementStyle.strikethrough ?? false,
+  };
+
+  const hasReplacement = replacementText !== undefined && replacementText.length > 0;
+  const hasRange = endIndex > startIndex;
+
+  if (hasReplacement) {
+    if (insertionPosition === 'AFTER') {
+      reqs.push({ insertText: { location: withTab({ index: endIndex }, tab.tabId), text: replacementText } });
+      reqs.push(
+        buildUpdateTextStyleRequest(
+          withTab({ startIndex: endIndex, endIndex: endIndex + replacementText.length }, tab.tabId),
+          effReplacementStyle,
+        ),
+      );
+      if (hasRange) {
+        reqs.push(buildUpdateTextStyleRequest(withTab({ startIndex, endIndex }, tab.tabId), retainedStyle));
+      }
+    } else {
+      // insertionPosition === 'BEFORE'
+      reqs.push({ insertText: { location: withTab({ index: startIndex }, tab.tabId), text: replacementText } });
+      reqs.push(
+        buildUpdateTextStyleRequest(
+          withTab({ startIndex, endIndex: startIndex + replacementText.length }, tab.tabId),
+          effReplacementStyle,
+        ),
+      );
+      if (hasRange) {
+        reqs.push(
+          buildUpdateTextStyleRequest(
+            withTab(
+              { startIndex: startIndex + replacementText.length, endIndex: endIndex + replacementText.length },
+              tab.tabId,
+            ),
+            retainedStyle,
+          ),
+        );
+      }
+    }
+  } else if (hasRange) {
+    // Retained deletion / strike-out only without replacement text
+    reqs.push(buildUpdateTextStyleRequest(withTab({ startIndex, endIndex }, tab.tabId), retainedStyle));
+  }
+
+  return reqs;
+}
+
+/** Builds requests for many redline edits, applied strictly bottom-to-top. */
+export function buildMultiRedlineRequests(tab: TabModel, edits: RedlineEdit[]): DocsRequest[] {
+  return sortEditsDescending(edits).flatMap((e) => buildRedlineRequests(tab, e));
+}
+

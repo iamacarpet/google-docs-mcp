@@ -1,45 +1,51 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Docs editorial MCP server with first-class support for native comments, comment anchors, suggestion mode, rich text formatting, tables, images, and paragraph layout.
+export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Docs editorial MCP server with first-class support for native comments, comment anchors, suggestion mode, redline amendments, rich text formatting, tables, images, and paragraph layout.
 
-1. WORKFLOW DISCOVERY FIRST & LOW-TOKEN READING
-   - Start with doc_list_comments to survey open review threads, or doc_get_outline / doc_get_metadata to orient yourself.
-   - Do NOT read the whole document unless explicitly asked. Use doc_read_comment_context(commentId) for a comment's anchored text plus surrounding paragraphs, and doc_read_range for an outline section (startIndex..sectionEndIndex).
-   - Low-token reading: doc_read_range returns plain text and compact Markdown annotatedText by default (with **bold**, *italic*, <u>underline</u>, ~~strikethrough~~, links, and image placeholders). This conveys full formatting without context bloat.
+1. DOCUMENT READING & NAVIGATION
+   - Quick orientation: Start with doc_list_comments to survey review threads, or doc_get_outline / doc_get_metadata to orient yourself.
+   - Low-token reading: doc_read_range returns plain text and compact Markdown annotatedText by default (with **bold**, *italic*, <u>underline</u>, ~~strikethrough~~, links, and image placeholders). Omit startIndex and endIndex to read the full active tab.
+   - Full document reading:
+     * Use doc_read_document to read the entire document in token-optimized Markdown with outline hierarchy, section markers, pending suggestions summary, and tables overview.
+     * When raw Google Docs REST API AST is needed (e.g. for official Google Workspace MCP read_doc parity), pass format: "raw_json".
+   - Context reading: Use doc_read_comment_context(commentId) for a comment's anchored text plus surrounding paragraphs.
    - Suggestions vs. Document Formatting:
      * In annotatedText, ~~strikethrough~~ (and **~~bold strikethrough~~**) represents INTENTIONAL document-level text formatting (such as retained wording under formal style guides, or form options). It is NOT a Google Docs suggestion!
      * Google Docs pending suggestions are tracked changes, rendered as [-deleted text-] and {+inserted text+} (markSuggestions is enabled by default).
      * Range queries report hasPendingSuggestions and pendingSuggestions metadata with exact suggestion IDs, kinds, and bounds.
-   - Selective granular flags in doc_read_range:
+   - Selective granular flags in doc_read_range / doc_read_document:
      * includeRuns: false (default). Set true ONLY when you need exact integer index bounds for each individual styled word or span. Styled runs include suggestion metadata (suggestion.kind: 'deletion' | 'insertion') to distinguish native suggestions from formatting.
      * includeParagraphs: false (default). Set true ONLY when inspecting paragraph layout, spacing, padding, margins, or borders.
      * In doc_inspect_tables: set includeCellText: false if you only need table dimensions, column counts, and index coordinates.
 
-2. EDITORIAL SUGGESTION POLICY & TWO EDITING PATTERNS
+2. EDITORIAL SUGGESTION POLICY & THREE EDITING PATTERNS
    - By default ALL revisions must be submitted as SUGGESTIONS (tracked changes), never direct overwrites.
    - Pattern A: Native Docs Tracked Changes (Full Deletion / Standard Revisions):
-     * To delete/remove text: use doc_suggest_deletion (or doc_suggest_edit_range with suggestedText: ""). Google Docs marks the text as a suggested deletion (which Docs displays visually with strikethrough in its web UI). When accepted, the text is removed.
+     * To delete/remove text: use doc_suggest_deletion (or doc_suggest_edit_range with suggestedText: ""). Google Docs marks the text as a suggested deletion. When accepted, the text is removed.
      * To replace text: use doc_suggest_edit_range with [startIndex, endIndex) and suggestedText.
      * To insert text: use doc_suggest_edit_range with startIndex === endIndex and suggestedText.
      * Optional textStyle on edit tools formats ONLY the newly inserted text. NEVER apply textStyle.strikethrough to simulate deletion.
-   - Pattern B: Style-Guide Formal Amendments (Retain Original Wording as Bold Strikethrough):
-     * When a formal style guide requires RETAINING original wording as bold strikethrough rather than removing it, and adding new text as bold:
-       CRITICAL SEQUENCING: ALWAYS insert the new text FIRST, and format the original text SECOND!
-       If you format first, Google Docs will automatically expand the bold strikethrough suggestion to swallow the inserted text at the boundary, striking through both!
-       1) Do NOT use doc_suggest_deletion.
-       2) Insert the new text FIRST: use doc_suggest_edit_range with startIndex === endIndex (at the boundary of original text), suggestedText: " new text", and textStyle: { bold: true, strikethrough: false }.
-       3) Format the original text SECOND: use doc_format_text with startIndex and endIndex matching the original text, expectedText, bold: true, strikethrough: true, and writeMode: "SUGGEST".
-   - For comment-driven edits: use doc_suggest_comment_revision (replaces comment's anchored text in suggestion mode and resolves thread).
-   - For several edits at once: use doc_batch_suggest_edits (applied bottom-up automatically).
-   - Use doc_apply_direct_edit ONLY if the user explicitly says e.g. "overwrite directly", "do not use suggestions" or "make definitive edits".
+   - Pattern B: Styled Redline / Formal Amendments (Retain Original Wording alongside New Text):
+     * When a style guide requires RETAINING original wording (e.g. as bold strikethrough) rather than removing it, and adding new text (e.g. as bold):
+     * Use doc_suggest_redline_edit! It automatically executes the Docs API sequence to avoid the boundary-swallowing bug (placing and styling inserted text first, and formatting retained original text second).
+     * Fully configurable: specify retainedStyle (default: { bold: true, strikethrough: true }) and replacementStyle (default: { bold: true, strikethrough: false }), or customize colors/italics for any role or process stage.
+     * In batch edits: set redline: true on any item in doc_batch_suggest_edits.
+   - Pattern C: Global Search & Replace:
+     * Use doc_suggest_replace_all to propose search-and-replace revisions across the entire tab in suggestion mode in ONE atomic call. Supports both native tracked replacements and redline mode (original retained as bold strikethrough).
 
-3. RICH TEXT FORMATTING & INLINE STYLES
+3. BATCH OPERATIONS & WORKFLOW AUTOMATION
+   - Batch Suggest Edits: Use doc_batch_suggest_edits to submit up to 50 edits across comments or ranges in one atomic batchUpdate. Automatically sorted bottom-up to prevent index drift. Supports standard edits, pure insertions, deletions, and redline amendments.
+   - Batch Manage Suggestions: Use doc_batch_manage_suggestions to accept or reject multiple suggestions at once (specify suggestionIds or pass action: "ACCEPT_ALL" / "REJECT_ALL").
+   - Raw Docs API Escape Hatch: Use doc_raw_batch_update to send ANY raw Google Docs REST API requests (parity with official Google Workspace MCP update_doc), with writeMode: "SUGGEST" or "EDIT".
+   - Document Creation: Use doc_create_document to create a new document in Google Drive with an optional initial text body.
+
+4. RICH TEXT FORMATTING & INLINE STYLES
    - Format existing spans: Use doc_format_text to apply styling properties (bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl) to any range in SUGGEST or EDIT mode.
    - Warning on strikethrough: doc_format_text with strikethrough: true applies a font style and keeps the text in the document. Never use it to delete text (use doc_suggest_deletion instead).
-   - Style while editing: Edit tools (doc_suggest_edit_range, doc_apply_direct_edit, doc_suggest_comment_revision, doc_batch_suggest_edits) accept an optional textStyle object ({ bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, linkUrl }) to style inserted or replaced text immediately in the same call.
+   - Style while editing: Edit tools accept an optional textStyle object to style inserted or replaced text immediately in the same call.
 
-4. PARAGRAPH STYLES, SPACING & PADDING
+5. PARAGRAPH STYLES, SPACING & PADDING
    - Use doc_format_paragraph to customize paragraphs overlapping [startIndex, endIndex):
      * Headings: namedStyleType ('TITLE', 'SUBTITLE', 'HEADING_1' through 'HEADING_6', 'NORMAL_TEXT').
      * Alignment: alignment ('START', 'CENTER', 'END', 'JUSTIFIED').
@@ -50,14 +56,13 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Pagination Controls: keepWithNext (keeps headings with the following paragraph), keepLinesTogether, avoidWidowAndOrphan, pageBreakBefore.
      * Lists: bulletPreset ('BULLET_DISC_CIRCLE_SQUARE', 'BULLET_CHECKBOX', 'NUMBERED_DECIMAL_ALPHA_ROMAN', etc.) or removeBullets.
 
-5. TABLES & IMAGES
-   - Tables: Inspect tables via doc_inspect_tables. Insert tables via doc_insert_table. Add or remove rows/columns via doc_modify_table.
+6. TABLES & IMAGES
+   - Tables: Inspect tables via doc_inspect_tables. Insert tables via doc_insert_table (supports optional cells: string[][] 2D text matrix to populate cells immediately). Add or remove rows/columns via doc_modify_table.
    - Images: Insert inline images via doc_insert_image from public HTTPS URLs with optional widthPt and heightPt.
 
-6. CHARACTER COORDINATES & INDEX INTEGRITY
+7. CHARACTER COORDINATES & INDEX INTEGRITY
    - Indices are exact 0-based UTF-16 code unit offsets, global to the document tab. Never approximate, guess or re-base them.
-   - Always take indices from doc_list_comments, doc_read_comment_context, doc_search_text, doc_get_outline, doc_inspect_tables, or doc_list_suggestions.
-   - Pass expectedText (the exact current text of the range) to range-based edit tools whenever you can; the edit is rejected instead of corrupting text if the document changed.
+   - Pass expectedText to edit tools; smart normalization tolerates unicode curly quotes, dashes, and non-breaking spaces while protecting against conflicting concurrent edits.
    - Keep each edit scoped to the minimum span (the comment's highlighted anchor or the exact phrase) to avoid unintended deletions.`;
 
 export function reviewCommentsPrompt(documentId: string, tone?: string): string {

@@ -28,6 +28,7 @@ export interface DocsBackend {
     requests: any[],
     writeControl?: docs_v1.Schema$WriteControl,
   ): Promise<docs_v1.Schema$BatchUpdateDocumentResponse>;
+  createDocument?(title: string): Promise<docs_v1.Schema$Document>;
 }
 
 export function httpStatus(e: unknown): number | undefined {
@@ -84,6 +85,13 @@ export class GoogleDocsBackend implements DocsBackend {
     const res = await this.api.documents.batchUpdate({
       documentId,
       requestBody: { requests, ...(writeControl ? { writeControl } : {}) },
+    });
+    return res.data;
+  }
+
+  async createDocument(title: string): Promise<docs_v1.Schema$Document> {
+    const res = await this.api.documents.create({
+      requestBody: { title },
     });
     return res.data;
   }

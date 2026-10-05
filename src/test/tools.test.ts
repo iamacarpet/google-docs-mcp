@@ -792,7 +792,7 @@ describe('MCP Tools', () => {
     assert.equal(res.startIndex, 131);
     assert.equal(res.endIndex, 218);
     assert.equal(res.safeAppendIndex, 217);
-    assert.equal(res.safePrependIndex, 131);
+    assert.equal(res.safePrependIndex, 132);
     assert.ok(res.annotatedText.includes('Deliverable includes'));
   });
 
@@ -829,9 +829,9 @@ describe('MCP Tools', () => {
 
     assert.equal(resPrepend.status, 'ok');
     assert.equal(resPrepend.position, 'START');
-    assert.equal(resPrepend.insertedIndex, 106); // cell.startIndex
+    assert.equal(resPrepend.insertedIndex, 107); // cell.contentStartIndex (first paragraph in cell)
     const prependCall = backend.batchCalls[backend.batchCalls.length - 1];
-    assert.ok(prependCall.requests.some((r: any) => r.insertText?.location?.index === 106));
+    assert.ok(prependCall.requests.some((r: any) => r.insertText?.location?.index === 107));
   });
 
   it('doc_read_range: returns cells array when spanning table cells', async () => {

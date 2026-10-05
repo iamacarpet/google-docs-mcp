@@ -64,11 +64,14 @@ export const SERVER_INSTRUCTIONS = `You are connected to an optimized Google Doc
      * Lists: bulletPreset ('BULLET_DISC_CIRCLE_SQUARE', 'BULLET_CHECKBOX', 'NUMBERED_DECIMAL_ALPHA_ROMAN', etc.) or removeBullets.
 
 6. TABLES (INCLUDING LARGE MULTI-LINE / MULTI-PARAGRAPH CELLS) & IMAGES
+   - Fresh Chat Table Discovery (Finding Tables & Headers Fast):
+     * Option A (Integrated Outline): Run doc_get_outline(documentId, includeTables: true). Each section in the outline shows which tables are inside it, their dimensions, total character count, and column headers!
+     * Option B (Dedicated Table Directory): Run doc_inspect_tables(documentId, headersOnly: true). Returns a lightweight catalog of all tables in the document with their preceding heading context, column headers, rows/columns, and total character sizes, without dumping cell text.
    - Working with Tables & Multi-Line Cells (e.g. Legal briefs, Tribunals, EHCPs, or complex forms):
      * The Single-Line Markdown Trap: Standard Markdown grid tables flatten multi-line cells into giant single lines (destroying paragraph breaks, lists, and formatting).
      * BEST PRACTICE FOR MULTI-LINE CELLS: Use doc_read_table with format: "record" (or format: "all"). This outputs a structured block/card view per row and column that preserves all paragraphs, bullet points, headers, rich formatting (bold, strikethrough), and tracked changes ([-deleted-]/{+inserted+}), alongside exact character coordinates!
      * Single-Cell Inspection: Use doc_read_table_cell to target a specific cell by (tableIndex, rowIndex, columnIndex). It returns the resolved column header, paragraph count, exact bounds, and safe insertion offsets without loading unnecessary document content.
-     * Table Inspection: Use doc_inspect_tables to survey table dimensions, rows, columns, and index coordinates.
+     * Table Inspection: Use doc_inspect_tables to survey table dimensions, rows, columns, character sizes, and index coordinates.
      * Cell Insertion / Appending (Avoiding Docs API Delimiter Errors):
        - Google Docs API table cells end with a structural newline delimiter. Inserting at cell.endIndex triggers an invalid index error!
        - ALWAYS use doc_append_to_table_cell (or insert at safeAppendIndex = cell.endIndex - 1) to append text to a table cell safely.
@@ -105,12 +108,12 @@ Steps:
 1. Locate the target section using doc_get_outline or doc_search_text.
 2. Call doc_read_range with includeAnnotatedText=true (and includeParagraphs=true if inspecting paragraph spacing or margins) to analyze the section.
 3. Identify formatting or layout improvements:${goal ? `\n   Goal: ${goal}.` : ''}
-   - Inconsistent heading styles, line spacing, or paragraph gaps (spaceAbove / spaceBelow).
-   - Missing emphasis (bold, italic) or unstyled terms.
-   - Lists that should use bulletPreset.
+    - Inconsistent heading styles, line spacing, or paragraph gaps (spaceAbove / spaceBelow).
+    - Missing emphasis (bold, italic) or unstyled terms.
+    - Lists that should use bulletPreset.
 4. Apply improvements:
-   - For paragraph layout (spacing, alignment, indentation, border padding, shading), use doc_format_paragraph.
-   - For text styling (bold, italic, links, colors), use doc_format_text or edit tools with textStyle.
+    - For paragraph layout (spacing, alignment, indentation, border padding, shading), use doc_format_paragraph.
+    - For text styling (bold, italic, links, colors), use doc_format_text or edit tools with textStyle.
 5. Summarize the changes and layout parameters applied.`;
 }
 
@@ -119,8 +122,8 @@ export function inspectLayoutPrompt(documentId: string): string {
 
 Steps:
 1. Check overall document statistics with doc_get_metadata (character count, table count, image count).
-2. Fetch the document outline hierarchy with doc_get_outline.
-3. If tables are present, inspect their dimensions and structure with doc_inspect_tables (using includeCellText=false for a compact survey).
+2. Fetch the document outline hierarchy with doc_get_outline (use includeTables=true to map tables within sections).
+3. If tables are present, inspect their headers and dimensions with doc_inspect_tables (using headersOnly=true for a compact survey).
 4. Provide a structured report of the document's sections, tables, and formatting profile.`;
 }
 
@@ -128,7 +131,8 @@ export function reviewTableSectionPrompt(documentId: string, tableIndex?: number
   return `Review and analyze tabular sections in Google Doc ${documentId}${tableIndex !== undefined ? ` (table index: ${tableIndex})` : ''}.
 
 Steps:
-1. Call doc_inspect_tables to survey all tables in the document and understand their dimensions, rows, columns, and index coordinates.
+1. In a fresh chat or document analysis, discover tables and their locations:
+   - Call doc_inspect_tables with headersOnly: true (or doc_get_outline with includeTables: true) to survey all tables, their surrounding section headings, dimensions, character counts, and column headers with zero token bloat.
 2. For tables containing large multi-line or multi-paragraph cells (e.g. legal working documents, tribunal schedules, EHCPs), call doc_read_table with format: "record".
    - This preserves all paragraphs, bullet points, headers, and tracked suggestions without flattening them into an unreadable single line.
 3. To inspect a specific cell or column (e.g. provision vs needs), use doc_read_table_cell with the target rowIndex and columnIndex.

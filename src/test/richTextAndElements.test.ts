@@ -337,6 +337,27 @@ describe('Rich Text, Layout & Document Elements Support', () => {
       assert.equal(res.totalTables, 1);
       assert.equal(res.tables[0].cells[0].row, 0);
       assert.equal(res.tables[0].cells[0].text, undefined);
+      assert.ok(res.tables[0].columnHeaders);
+      assert.equal(res.tables[0].columnHeaders[0], 'Requirement Item');
+      assert.ok(res.tables[0].precedingHeading);
+    });
+
+    it('doc_inspect_tables: headersOnly returns compact directory without cells array', async () => {
+      const { server } = await setupServer();
+      const res = await call(server, 'doc_inspect_tables', {
+        documentId: 'doc_formatted_001',
+        headersOnly: true,
+      });
+
+      assert.equal(res.totalTables, 1);
+      const t = res.tables[0];
+      assert.equal(t.rows, 2);
+      assert.equal(t.columns, 2);
+      assert.equal(t.cells, undefined);
+      assert.equal(t.columnHeaders[0], 'Requirement Item');
+      assert.equal(t.columnHeaders[1], 'Proposed Deliverables');
+      assert.equal(t.precedingHeading?.title, 'Section 1: Core Deliverables');
+      assert.ok(t.totalCharacters > 0);
     });
 
     it('doc_format_paragraph: applies spacing, padding, indentation and borders', async () => {

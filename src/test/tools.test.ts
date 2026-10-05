@@ -124,6 +124,24 @@ describe('MCP Tools', () => {
     assert.equal(res.outline[1].isPseudo, true);
   });
 
+  it('doc_get_outline: includeTables maps nested tables and column headers to sections', async () => {
+    backend.rawDoc = createFormattedDocument();
+    cache.clear();
+    const res = await callTool('doc_get_outline', {
+      documentId: 'doc_formatted_001',
+      includeTables: true,
+    });
+
+    assert.ok(res.outline.length > 0);
+    const sec1 = res.outline.find((o: any) => (o.title ?? o.text)?.includes('Section 1'));
+    assert.ok(sec1);
+    assert.ok(sec1.tables);
+    assert.equal(sec1.tables.length, 1);
+    assert.equal(sec1.tables[0].tableIndex, 0);
+    assert.equal(sec1.tables[0].columnHeaders[0], 'Requirement Item');
+    assert.equal(sec1.tables[0].columnHeaders[1], 'Proposed Deliverables');
+  });
+
   it('doc_list_comments: lists open comments with authors and anchors', async () => {
     const res = await callTool('doc_list_comments', { documentId: 'doc_test_123', status: 'OPEN' });
     assert.equal(res.comments.length, 1);

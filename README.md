@@ -213,7 +213,7 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 |---|---|---|
 | `doc_get_changes_summary` | Editorial digest | Generates a high-level changelog and editorial digest of pending suggestions and open comments, broken down by author and outline section heading. |
 | `doc_get_metadata` | Document status | Returns title, revisionId, character count, tab listing, table count, image count, comments summary, and suggestion count. |
-| `doc_get_outline` | Document structure | Returns hierarchical outline of formal headings (`HEADING_1`..`HEADING_6`, `TITLE`) and pseudo-headings (bold/enlarged single-line section dividers < 80 chars) with exact global coordinates and `sectionEndIndex`. |
+| `doc_get_outline` | Document structure | Returns hierarchical outline of formal headings (`HEADING_1`..`HEADING_6`, `TITLE`) and pseudo-headings (bold/enlarged single-line section dividers < 80 chars) with exact global coordinates and `sectionEndIndex`. Supports `includeTables: true` to map nested tables and column headers within sections. |
 | `doc_list_comments` | Survey feedback | Surveys comment threads with author, status (`OPEN` / `RESOLVED`), feedback text, current anchor text, and coordinates. Supports filters by `author`, keyword `query`, range bounds (`startIndex`/`endIndex`), and section grouping (`groupBySection: true`). |
 | `doc_search_text` | Find text | Finds occurrences of terms/phrases across the document buffer without dumping content into context; returns exact `startIndex`/`endIndex` and snippet preview. |
 | `doc_list_suggestions` | Tracked changes | Lists pending suggestions (insertions, deletions, text styles) with `suggestionId`, type, author, summary, and preview. |
@@ -227,7 +227,7 @@ claude mcp add docs-mcp -e GOOGLE_CLIENT_ID=your-client-id.apps.googleuserconten
 | `doc_read_table_cell` | Single cell inspection | Reads an individual table cell by `rowIndex` and `columnIndex`. Preserves multi-paragraph layouts, rich styling, and tracked changes, returning `columnHeader`, `safeAppendIndex`, `characterCount`, and `paragraphCount`. |
 | `doc_read_comment_context` | Read around comment | Fetches the targeted sentence and surrounding paragraph(s) for a given `commentId`, wrapping the anchor in `<target>...</target>` tags, with anchor style runs and table context. |
 | `doc_read_range` | Read bounds with Rich Text | Reads text between `startIndex` and `endIndex` (or entire tab if bounds omitted). Returns raw plain text, rich Markdown `annotatedText` (bold, italic, underline, strikethrough, images), structured `runs`, `paragraphs` with full style/spacing/padding metadata, `tableContext`, and `cells` in range. |
-| `doc_inspect_tables` | Inspect tables | Lists all tables in the document (or a specific table) with dimensions, start/end index, and cell matrix (row, column, text, startIndex, endIndex). Supports `includeCellText: false` for low-token structural inspections. |
+| `doc_inspect_tables` | Table Discovery & Inspection | Lists tables with dimensions, preceding heading context, column headers, total character counts, and cell coordinates. Supports `headersOnly: true` for zero-token discovery of what tables exist in a document. |
 
 ### Category C: Safe Mutation, Suggestions & Batch Endpoints
 

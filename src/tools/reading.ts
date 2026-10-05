@@ -9,9 +9,11 @@ import {
   getCellsInRange,
   getImagesInRange,
   getParagraphsInRange,
+  getPrecedingHeading,
   getRunsInRange,
   getSuggestionsInRange,
   getTab,
+  getTableColumnHeaders,
   getTableContext,
   getTablesInRange,
   paragraphIndexAt,
@@ -395,21 +397,26 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
   server.registerTool(
     'doc_inspect_tables',
     {
-      title: 'Inspect document tables',
+      title: 'Inspect document tables & headers',
       description:
-        'Lists all tables in the document (or tab) with their dimensions, index bounds, and matrix of cells (row, column, text, startIndex, endIndex). Essential for navigating and editing tabular sections.',
+        'Lists tables in the document (or tab) with their preceding heading context, column headers, dimensions, total character counts, and cell coordinates. ' +
+        'Set headersOnly: true for a compact catalog of all tables and their headers without downloading cell text or cell arrays. Perfect for initial table discovery in a fresh chat.',
       inputSchema: {
         documentId: documentIdSchema,
         tabId: tabIdSchema,
         tableIndex: z.number().int().nonnegative().optional().describe('Inspect only this specific table index (0-indexed).'),
+        headersOnly: z
+          .boolean()
+          .optional()
+          .describe('When true, returns only the table summary, preceding heading, dimensions, total character count, and columnHeaders (omits cells array). Perfect for discovering tables without token bloat.'),
         includeCellText: z
           .boolean()
           .optional()
-          .describe('Include cell text contents (default true). Set false to inspect only table dimensions, rows, columns, and index coordinates without text.'),
+          .describe('Include cell text contents (default true when headersOnly is false). Set false to inspect cell coordinates and character counts without cell text.'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, tabId, tableIndex, includeCellText }) => {
+    safe(async ({ documentId, tabId, tableIndex, headersOnly, includeCellText }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
       let tables = tab.tables;
@@ -422,20 +429,37 @@ export function registerReadingTools(server: McpServer, ctx: ToolContext): void 
         revisionId: m.revisionId,
         tabId: tab.tabId && m.tabs.length > 1 ? tab.tabId : undefined,
         totalTables: tab.tables.length,
-        tables: tables.map((t) => ({
-          tableIndex: t.tableIndex,
-          startIndex: t.startIndex,
-          endIndex: t.endIndex,
-          rows: t.rows,
-          columns: t.columns,
-          cells: t.cells.map((c) => ({
-            row: c.rowIndex,
-            col: c.columnIndex,
-            startIndex: c.startIndex,
-            endIndex: c.endIndex,
-            ...(includeCellText !== false ? { text: c.text } : {}),
-          })),
-        })),
+        tables: tables.map((t) => {
+          const totalCharacters = t.cells.reduce((sum, c) => sum + (c.endIndex - c.startIndex), 0);
+          const precedingHeading = getPrecedingHeading(tab, t.startIndex);
+          const columnHeaders = getTableColumnHeaders(tab, t);
+
+          return {
+            tableIndex: t.tableIndex,
+            startIndex: t.startIndex,
+            endIndex: t.endIndex,
+            rows: t.rows,
+            columns: t.columns,
+            totalCharacters,
+            precedingHeading: precedingHeading
+              ? { title: precedingHeading.title, level: precedingHeading.level, startIndex: precedingHeading.startIndex }
+              : null,
+            columnHeaders,
+            ...(!headersOnly
+              ? {
+                  cells: t.cells.map((c) => ({
+                    row: c.rowIndex,
+                    col: c.columnIndex,
+                    startIndex: c.startIndex,
+                    endIndex: c.endIndex,
+                    characterCount: c.endIndex - c.startIndex,
+                    safeAppendIndex: Math.max(c.startIndex, c.endIndex - 1),
+                    ...(includeCellText !== false ? { text: c.text } : {}),
+                  })),
+                }
+              : {}),
+          };
+        }),
       });
     }),
   );

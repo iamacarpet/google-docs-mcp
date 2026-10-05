@@ -944,6 +944,42 @@ export function getImagesInRange(tab: TabModel, start: number, end: number): Ima
   return tab.images.filter((img) => img.endIndex > start && img.startIndex < end);
 }
 
+export interface HeadingContext {
+  title: string;
+  level: number;
+  startIndex: number;
+  isPseudo?: boolean;
+}
+
+export function getPrecedingHeading(tab: TabModel, startIndex: number): HeadingContext | null {
+  let best: HeadingContext | null = null;
+  for (const o of tab.outline) {
+    if (o.startIndex <= startIndex) {
+      if (!best || o.startIndex > best.startIndex) {
+        best = { title: o.title, level: o.level, startIndex: o.startIndex, isPseudo: o.isPseudo };
+      }
+    }
+  }
+  return best;
+}
+
+export function getTableColumnHeaders(tab: TabModel, table: TableModel): string[] {
+  const headers: string[] = [];
+  for (let c = 0; c < table.columns; c++) {
+    const cell = table.cells.find((cl) => cl.rowIndex === 0 && cl.columnIndex === c);
+    if (cell) {
+      const text = renderText(tab, cell.startIndex, cell.endIndex, false)
+        .replace(/[\x00\x0B]/g, '')
+        .trim();
+      const firstLine = text.split('\n')[0]?.trim() || '';
+      headers.push(firstLine && firstLine.length < 120 ? firstLine : (text.slice(0, 120).trim() || `Column ${c}`));
+    } else {
+      headers.push(`Column ${c}`);
+    }
+  }
+  return headers;
+}
+
 function foldChar(c: string): string {
   const l = c.toLowerCase();
   return l.length === 1 ? l : c; // keep length identical to preserve indices

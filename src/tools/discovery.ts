@@ -8,6 +8,7 @@ import {
   GAP,
   collectSuggestionIds,
   getTab,
+  getTableColumnHeaders,
   renderText,
   searchText,
   truncate,
@@ -83,22 +84,90 @@ export function registerDiscoveryTools(server: McpServer, ctx: ToolContext): voi
     {
       title: 'Get document outline',
       description:
-        'Retrieves the structural outline of the document: formal headings (TITLE=level 0, HEADING_n=level n) plus visually bolded / enlarged single-line section dividers (isPseudo=true), with exact indices, without downloading document text. sectionEndIndex marks where the section ends, so doc_read_range(startIndex, sectionEndIndex) reads one section.',
+        'Retrieves the structural outline of the document: formal headings (TITLE=level 0, HEADING_n=level n) plus visually bolded / enlarged single-line section dividers (isPseudo=true), with exact indices, without downloading document text. sectionEndIndex marks where the section ends, so doc_read_range(startIndex, sectionEndIndex) reads one section. ' +
+        'Set includeTables: true to also see which tables are located within each section and their column headers.',
       inputSchema: {
         documentId: documentIdSchema,
         tabId: tabIdSchema,
         includePseudo: z.boolean().optional().describe('Include pseudo-headings (default true).'),
+        includeTables: z
+          .boolean()
+          .optional()
+          .describe('Include tables located within each section, along with dimensions and column headers (default false).'),
         maxLevel: z.number().int().min(0).max(6).optional().describe('Only return entries with level <= maxLevel.'),
       },
       annotations: RO,
     },
-    safe(async ({ documentId, tabId, includePseudo, maxLevel }) => {
+    safe(async ({ documentId, tabId, includePseudo, includeTables, maxLevel }) => {
       const m = await load(documentId);
       const tab = getTab(m, tabId);
       const outline = tab.outline.filter(
         (o) => (includePseudo !== false || !o.isPseudo) && (maxLevel === undefined || o.level <= maxLevel),
       );
-      return ok({ revisionId: m.revisionId, tabId: tab.tabId || undefined, outline });
+
+      const items = outline.map((o) => {
+        if (!includeTables) return o;
+        const sectionTables = tab.tables
+          .filter((t) => t.startIndex >= o.startIndex && t.startIndex < o.sectionEndIndex)
+          .map((t) => ({
+            tableIndex: t.tableIndex,
+            startIndex: t.startIndex,
+            endIndex: t.endIndex,
+            rows: t.rows,
+            columns: t.columns,
+            totalCharacters: t.cells.reduce((sum, c) => sum + (c.endIndex - c.startIndex), 0),
+            columnHeaders: getTableColumnHeaders(tab, t),
+          }));
+        return {
+          ...o,
+          tables: sectionTables.length ? sectionTables : undefined,
+        };
+      });
+
+      let unsectionedTables: Array<{
+        tableIndex: number;
+        startIndex: number;
+        endIndex: number;
+        rows: number;
+        columns: number;
+        totalCharacters: number;
+        columnHeaders: string[];
+      }> | undefined;
+
+      if (includeTables) {
+        if (outline.length > 0) {
+          const firstStart = outline[0].startIndex;
+          const beforeFirst = tab.tables.filter((t) => t.startIndex < firstStart);
+          if (beforeFirst.length > 0) {
+            unsectionedTables = beforeFirst.map((t) => ({
+              tableIndex: t.tableIndex,
+              startIndex: t.startIndex,
+              endIndex: t.endIndex,
+              rows: t.rows,
+              columns: t.columns,
+              totalCharacters: t.cells.reduce((sum, c) => sum + (c.endIndex - c.startIndex), 0),
+              columnHeaders: getTableColumnHeaders(tab, t),
+            }));
+          }
+        } else if (tab.tables.length > 0) {
+          unsectionedTables = tab.tables.map((t) => ({
+            tableIndex: t.tableIndex,
+            startIndex: t.startIndex,
+            endIndex: t.endIndex,
+            rows: t.rows,
+            columns: t.columns,
+            totalCharacters: t.cells.reduce((sum, c) => sum + (c.endIndex - c.startIndex), 0),
+            columnHeaders: getTableColumnHeaders(tab, t),
+          }));
+        }
+      }
+
+      return ok({
+        revisionId: m.revisionId,
+        tabId: tab.tabId || undefined,
+        outline: items,
+        ...(unsectionedTables ? { unsectionedTables } : {}),
+      });
     }),
   );
 
